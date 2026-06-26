@@ -200,285 +200,260 @@ LRESULT CALLBACK WndProcHook(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam){
 // ===================================================================
 // D3D11 PRESENT HOOK + IMGUI
 // ===================================================================
-class D3D11Hook {
-    ID3D11Device*dev=nullptr;ID3D11DeviceContext*ctx=nullptr;
-    IDXGISwapChain*sc=nullptr;ID3D11RenderTargetView*rtv=nullptr;
-    bool init=false; int sw=1920,sh=1080;
-    HWND hGameWnd=nullptr;
-    typedef HRESULT(__stdcall*P_t)(IDXGISwapChain*,UINT,UINT);P_t orig=nullptr;
-public:
-    static D3D11Hook*inst;
-    static HRESULT __stdcall Hook(IDXGISwapChain*c,UINT s,UINT f){
-        return inst->OnPresent(c,s,f);
-    }
+typedef HRESULT(__stdcall* Present_t)(IDXGISwapChain*, UINT, UINT);
+Present_t orig = nullptr;
 
-    HRESULT OnPresent(IDXGISwapChain*c,UINT s,UINT f){
-        if(!init){
-            sc=c;sc->GetDevice(__uuidof(ID3D11Device),(void**)&dev);dev->GetImmediateContext(&ctx);
-            ID3D11Texture2D*bb=nullptr;sc->GetBuffer(0,__uuidof(ID3D11Texture2D),(void**)&bb);
-            dev->CreateRenderTargetView(bb,nullptr,&rtv);bb->Release();
-            DXGI_SWAP_CHAIN_DESC d;sc->GetDesc(&d);sw=d.BufferDesc.Width;sh=d.BufferDesc.Height;
+struct D3D11Hook {
+    ID3D11Device* pd3dDevice = nullptr;
+    ID3D11DeviceContext* pd3dContext = nullptr;
+    IDXGISwapChain* pSwapChain = nullptr;
+    bool init = false;
+    int frameCount = 0;
+    static D3D11Hook* inst;
 
-            // Get game window for ImGui
-            g_hWindow = d.OutputWindow;
-            oWndProc = (WNDPROC)SetWindowLongPtrW(g_hWindow, GWLP_WNDPROC, (LONG_PTR)WndProcHook);
+    static HRESULT __stdcall Hook(IDXGISwapChain* pSC, UINT Sync, UINT Flags) {
+        auto d = inst;
+        if (!d->init) {
+            d->pSwapChain = pSC;
+            d->pd3dDevice = nullptr;
+            d->pd3dContext = nullptr;
+            if (SUCCEEDED(pSC->GetDevice(__uuidof(ID3D11Device), (void**)&d->pd3dDevice))) {
+                d->pd3dDevice->GetImmediateContext(&d->pd3dContext);
+            }
 
-            // Init ImGui
+            DXGI_SWAP_CHAIN_DESC sd;
+            pSC->GetDesc(&sd);
+            g_hWindow = sd.OutputWindow;
+
+            IMGUI_CHECKVERSION();
             ImGui::CreateContext();
-            ImGuiIO& io = ImGui::GetIO(); io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-            ImGui_ImplWin32_Init(g_hWindow);
-            ImGui_ImplDX11_Init(dev, ctx);
+            ImGuiIO& io = ImGui::GetIO();
+            io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
             ImGui::StyleColorsDark();
 
-            init=true; printf("[+] ImGui initialized\n");
+            oWndProc = (WNDPROC)SetWindowLongPtrW(g_hWindow, GWLP_WNDPROC, (LONG_PTR)WndProcHook);
+
+            ImGui_ImplWin32_Init(g_hWindow);
+            ImGui_ImplDX11_Init(d->pd3dDevice, d->pd3dContext);
+
+            d->init = true;
+            printf("[+] ImGui initialized on HWND: 0x%llX\n", (uintptr_t)g_hWindow);
         }
 
-        // Draw ImGui
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // ====== OVERLAY DRAWING ======
-        DoESP();
-        if(cfg.menu) DrawMenu();
+        if (cfg.menu) {
+            ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Once);
+            ImGui::SetNextWindowSize(ImVec2(320, 420), ImGuiCond_Once);
+            ImGui::Begin("WT Tool v3.0", &cfg.menu, ImGuiWindowFlags_NoCollapse);
 
-        ImGui::EndFrame();
+            ImGui::Text("F1 - Toggle Console");
+            ImGui::Text("END - Unload DLL");
+            ImGui::Separator();
+
+            ImGui::Checkbox("ESP", &cfg.esp);
+            if (cfg.esp) {
+                ImGui::Indent();
+                ImGui::Checkbox("Box", &cfg.espBox);
+                ImGui::Checkbox("Snapline", &cfg.espSnap);
+                ImGui::Checkbox("Health Bar", &cfg.espHealth);
+                ImGui::Checkbox("Name", &cfg.espName);
+                ImGui::Checkbox("Team Check", &cfg.espTeamCheck);
+                ImGui::SliderFloat("Max Distance", &cfg.espMaxDist, 100.0f, 10000.0f, "%.0f");
+                ImGui::Unindent();
+            }
+
+            ImGui::Separator();
+
+            ImGui::Checkbox("Aimbot", &cfg.aim);
+            if (cfg.aim) {
+                ImGui::Indent();
+                ImGui::SliderFloat("FOV", &cfg.aimFov, 1.0f, 30.0f, "%.1f");
+                ImGui::SliderFloat("Smooth", &cfg.aimSmooth, 1.0f, 20.0f, "%.1f");
+                const char* keys[] = { "Left Mouse", "Right Mouse", "Middle Mouse", "X1 Mouse", "X2 Mouse" };
+                ImGui::Combo("Activation Key", &cfg.aimKey, keys, IM_ARRAYSIZE(keys));
+                ImGui::Unindent();
+            }
+
+            ImGui::Separator();
+
+            ImGui::Checkbox("Triggerbot", &cfg.trig);
+            if (cfg.trig) {
+                ImGui::Indent();
+                ImGui::SliderFloat("FOV", &cfg.trigFov, 1.0f, 30.0f, "%.1f");
+                ImGui::SliderInt("Min Delay (ms)", &cfg.trigMin, 0, 200);
+                ImGui::SliderInt("Max Delay (ms)", &cfg.trigMax, 0, 200);
+                if (cfg.trigMax < cfg.trigMin) cfg.trigMax = cfg.trigMin + 1;
+                ImGui::Unindent();
+            }
+
+            ImGui::Separator();
+
+            ImGui::Checkbox("Wallbang", &cfg.wb);
+            if (cfg.wb) {
+                ImGui::Indent();
+                if (ImGui::SliderFloat("Penetration Multiplier", &cfg.penMult, 1.0f, 100.0f, "%.1fx")) {
+                    gMem.EnableWallbang();
+                }
+                ImGui::Unindent();
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Entities: %zu", gMem.GetEnts().size());
+            ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+            ImGui::End();
+        }
+
+        if (cfg.esp && !cfg.d3dHookFailed) {
+            RECT rect;
+            GetClientRect(g_hWindow, &rect);
+            int sw = rect.right - rect.left;
+            int sh = rect.bottom - rect.top;
+            if (sw <= 0 || sh <= 0) { sw = 1920; sh = 1080; }
+
+            auto lp = gMem.GetLP();
+            auto ents = gMem.GetEnts();
+
+            ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+            for (auto& e : ents) {
+                if (e.addr == lp.addr || !e.alive) continue;
+                if (cfg.espTeamCheck && e.team == lp.team) continue;
+                if (e.dist > cfg.espMaxDist) continue;
+
+                Vector2 sp, shp;
+                if (!gMem.W2S(e.pos, sp, sw, sh)) continue;
+                if (!gMem.W2S(e.head, shp, sw, sh)) continue;
+
+                float h = abs(sp.y - shp.y);
+                if (h < 5.0f) h = 20.0f;
+                float w = h * 0.6f;
+                float x = sp.x - w / 2;
+                float y = sp.y - h;
+
+                ImU32 color = (e.team == lp.team) ? IM_COL32(0, 255, 0, 220) : IM_COL32(255, 50, 50, 220);
+                ImU32 bg = IM_COL32(0, 0, 0, 180);
+
+                if (cfg.espBox) {
+                    dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), color, 0.0f, 0, 1.5f);
+                }
+
+                if (cfg.espSnap) {
+                    dl->AddLine(ImVec2(sw / 2.0f, (float)sh), ImVec2(sp.x, sp.y), color, 1.0f);
+                }
+
+                if (cfg.espHealth && e.mhp > 0) {
+                    float hpPct = e.hp / e.mhp;
+                    if (hpPct < 0) hpPct = 0;
+                    if (hpPct > 1) hpPct = 1;
+                    int barW = 3;
+                    int barX = (int)x - 6;
+                    dl->AddRectFilled(ImVec2((float)barX, y), ImVec2((float)(barX + barW), y + h), bg);
+                    float fillH = h * hpPct;
+                    ImU32 hpColor = IM_COL32((int)(255 * (1 - hpPct)), (int)(255 * hpPct), 0, 255);
+                    dl->AddRectFilled(ImVec2((float)barX, y + h - fillH), ImVec2((float)(barX + barW), y + h), hpColor);
+                }
+
+                if (cfg.espName && e.name[0]) {
+                    char label[128];
+                    snprintf(label, sizeof(label), "%s [%.0fm]", e.name, e.dist);
+                    ImVec2 textSize = ImGui::CalcTextSize(label);
+                    dl->AddText(ImVec2(sp.x - textSize.x / 2, y - textSize.y - 2), color, label);
+                }
+            }
+        }
+
         ImGui::Render();
-        ctx->OMSetRenderTargets(1, &rtv, NULL);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-        return orig(c,s,f);
+        return orig(pSC, Sync, Flags);
     }
 
-    // ====== ESP (uses ImGui DrawList for text) ======
-    void DoESP(){
-        if(!cfg.esp)return;
-        auto lp=gMem.GetLP();if(!lp.addr)return;
-        auto es=gMem.GetEnts();
-        ImDrawList* dl = ImGui::GetBackgroundDrawList();
-
-        for(auto&e:es){
-            if(e.addr==lp.addr||!e.alive)continue;
-            if(cfg.espTeamCheck&&e.team==lp.team)continue;
-            e.dist=(e.pos-lp.pos).Len();
-            if(e.dist>cfg.espMaxDist)continue;
-            if(!gMem.W2S(e.pos,e.sp,sw,sh)||!gMem.W2S(e.head,e.sh,sw,sh))continue;
-
-            float h=fabs(e.sp.y-e.sh.y);if(h<5)h=e.dist*0.05f;
-            float w=h*0.6f;if(w<6)w=6;if(h<6)h=6;
-            float bx=e.sp.x-w/2,by=e.sh.y;
-
-            ImU32 color = (e.team==lp.team) ? IM_COL32(0,255,0,180) : IM_COL32(255,0,0,180);
-            float alpha = (e.dist>1000) ? max(0.2f,1-e.dist/5000) : 1.0f;
-            ImU32 colFade = (e.team==lp.team) ? IM_COL32(0,255,0,(int)(255*alpha)) : IM_COL32(255,0,0,(int)(255*alpha));
-
-            if(cfg.espBox) dl->AddRect(ImVec2(bx,by), ImVec2(bx+w,by+h), colFade);
-            if(cfg.espSnap) dl->AddLine(ImVec2(sw/2.0f,sh), ImVec2(e.sp.x,e.sp.y), IM_COL32(255,255,255,60));
-            if(cfg.espHealth){
-                float p=e.hp/e.mhp;if(p<0)p=0;
-                dl->AddRectFilled(ImVec2(bx-6,by), ImVec2(bx-3,by+h), IM_COL32(0,0,0,150));
-                ImU32 hc = (p>0.5f)?IM_COL32(0,255,0,255):((p>0.25f)?IM_COL32(255,255,0,255):IM_COL32(255,0,0,255));
-                dl->AddRectFilled(ImVec2(bx-6,by+h*(1-p)), ImVec2(bx-3,by+h), hc);
-            }
-            if(cfg.espName) dl->AddText(ImVec2(bx,by-14), IM_COL32(255,255,255,200), e.name);
-
-            // Distance text
-            char dst[32]; sprintf_s(dst, "%.0fm", e.dist);
-            dl->AddText(ImVec2(bx+w+4,by+h-14), IM_COL32(255,255,255,150), dst);
-        }
-    }
-
-    // ====== MENU ======
-    void DrawMenu(){
-        ImGui::SetNextWindowSize(ImVec2(350, 420), ImGuiCond_FirstUseEver);
-        ImGui::Begin("WT Research Tool", &cfg.menu, ImGuiWindowFlags_NoCollapse);
-
-        if(ImGui::BeginTabBar("Tabs")){
-
-            // === ESP TAB ===
-            if(ImGui::BeginTabItem("ESP")){
-                ImGui::Checkbox("Enable ESP", &cfg.esp);
-                ImGui::Separator();
-                ImGui::Checkbox("Box ESP", &cfg.espBox);
-                ImGui::SameLine(); ImGui::Checkbox("Snaplines", &cfg.espSnap);
-                ImGui::Checkbox("Health Bar", &cfg.espHealth);
-                ImGui::SameLine(); ImGui::Checkbox("Names", &cfg.espName);
-                ImGui::Checkbox("Team Check", &cfg.espTeamCheck);
-                ImGui::SliderFloat("Max Distance", &cfg.espMaxDist, 100, 10000, "%.0fm");
-                ImGui::EndTabItem();
-            }
-
-            // === AIMBOT TAB ===
-            if(ImGui::BeginTabItem("Aimbot")){
-                ImGui::Checkbox("Enable Aimbot", &cfg.aim);
-                ImGui::Separator();
-                ImGui::SliderFloat("FOV", &cfg.aimFov, 1.0f, 30.0f, "%.1f px");
-                ImGui::SliderFloat("Smoothness", &cfg.aimSmooth, 1.0f, 20.0f, "%.1f");
-                ImGui::Combo("Activation Key", &cfg.aimKey, aimKeys, IM_ARRAYSIZE(aimKeys));
-                ImGui::EndTabItem();
-            }
-
-            // === TRIGGERBOT TAB ===
-            if(ImGui::BeginTabItem("Triggerbot")){
-                ImGui::Checkbox("Enable Triggerbot", &cfg.trig);
-                ImGui::Separator();
-                ImGui::SliderFloat("FOV", &cfg.trigFov, 1.0f, 50.0f, "%.1f px");
-                ImGui::SliderInt("Delay Min", &cfg.trigMin, 0, 200, "%d ms");
-                ImGui::SliderInt("Delay Max", &cfg.trigMax, 0, 200, "%d ms");
-                ImGui::EndTabItem();
-            }
-
-            // === WALLBANG TAB ===
-            if(ImGui::BeginTabItem("Wallbang")){
-                bool wbState = cfg.wb;
-                if(ImGui::Checkbox("Shoot Through Everything", &wbState)){
-                    cfg.wb=wbState;
-                    if(cfg.wb)gMem.EnableWallbang(); else gMem.DisableWallbang();
-                }
-                ImGui::Separator();
-                ImGui::SliderFloat("Pen Multiplier", &cfg.penMult, 1.0f, 50.0f, "%.1fx");
-                ImGui::TextWrapped("Patches the collision function so bullets pass through all geometry: walls, terrain, buildings, trees, ground.");
-                if(gMem.colAddr!=0){
-                    ImGui::Text("Collision func found: 0x%llX", gMem.colAddr);
-                } else {
-                    ImGui::TextColored(ImVec4(1,0,0,1), "Collision func not found. Wallbang may not work.");
-                }
-                ImGui::EndTabItem();
-            }
-
-            ImGui::EndTabBar();
-        }
-
-        ImGui::Separator();
-        ImGui::Text("INSERT - Toggle Menu | END - Unload");
-
-        ImGui::End();
-    }
-
-    bool HookD3D(){
-        // Simple approach: Use a window overlay instead of D3D hook
-        // This is more stable and doesn't crash the game
+    bool HookD3D() {
         HWND hGameWnd = NULL;
-        for(int i=0; i<100; i++){
+        for (int i = 0; i < 100; i++) {
             hGameWnd = FindWindowW(L"SDL_app", NULL);
-            if(!hGameWnd) hGameWnd = FindWindowW(NULL, L"War Thunder");
-            if(!hGameWnd) EnumWindows([](HWND h, LPARAM lp)->BOOL{
-                wchar_t cls[64]; GetClassNameW(h,cls,64);
-                if(wcsstr(cls,L"SDL")||wcsstr(cls,L"d3d")||wcsstr(cls,L"Win32")){
-                    DWORD pid; GetWindowThreadProcessId(h,&pid);
-                    if(pid==GetCurrentProcessId()){*(HWND*)lp=h;return FALSE;}
-                } return TRUE;
-            }, (LPARAM)&hGameWnd);
-            if(hGameWnd) break;
+            if (!hGameWnd) hGameWnd = FindWindowW(NULL, L"War Thunder");
+            if (!hGameWnd) {
+                EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+                    wchar_t cls[64]; GetClassNameW(h, cls, 64);
+                    if (wcsstr(cls, L"SDL") || wcsstr(cls, L"d3d") || wcsstr(cls, L"Win32")) {
+                        DWORD pid; GetWindowThreadProcessId(h, &pid);
+                        if (pid == GetCurrentProcessId()) { *(HWND*)lp = h; return FALSE; }
+                    }
+                    return TRUE;
+                }, (LPARAM)&hGameWnd);
+            }
+            if (hGameWnd) break;
             Sleep(50);
         }
-        if(!hGameWnd){printf("[!] Game window not found\n");return false;}
         printf("[+] Game window: 0x%llX\n", (uintptr_t)hGameWnd);
-        this->hGameWnd = hGameWnd;
 
-        // Get client area (not including borders)
-        RECT rect;
-        GetClientRect(hGameWnd, &rect);
-        int w = rect.right - rect.left;
-        int h = rect.bottom - rect.top;
-        sw = w; sh = h;
+        HWND hTemp = CreateWindowExA(0, "BUTTON", "", WS_POPUP, 0, 0, 1, 1, NULL, NULL, NULL, NULL);
 
-        // Map client area to screen coordinates
-        POINT pt = {0, 0};
-        ClientToScreen(hGameWnd, &pt);
+        ID3D11Device* td = NULL;
+        IDXGISwapChain* tc = NULL;
 
-        // Create overlay window - only over game client area
-        HWND hOverlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            L"STATIC", L"", WS_POPUP, pt.x, pt.y, w, h, NULL, NULL, NULL, NULL);
-        if(!hOverlay){printf("[!] Failed to create overlay window\n");return false;}
+        HWND targets[] = { hGameWnd, hTemp, GetDesktopWindow() };
+        D3D_DRIVER_TYPE types[] = { D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
+                                     D3D_DRIVER_TYPE_REFERENCE, D3D_DRIVER_TYPE_SOFTWARE };
 
-        ShowWindow(hOverlay, SW_SHOWNA);
+        for (int ti = 0; ti < 3; ti++) {
+            if (!targets[ti]) continue;
+            for (int di = 0; di < 4; di++) {
+                DXGI_SWAP_CHAIN_DESC sd = {};
+                sd.BufferCount = 1;
+                sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                sd.BufferDesc.Width = 1; sd.BufferDesc.Height = 1;
+                sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+                sd.OutputWindow = targets[ti];
+                sd.SampleDesc.Count = 1;
+                sd.Windowed = TRUE;
 
-        g_hWindow = hOverlay;
-        oWndProc = (WNDPROC)SetWindowLongPtrW(hOverlay, GWLP_WNDPROC, (LONG_PTR)WndProcHook);
-
-        // Initialize ImGui for the overlay window
-        ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO(); io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-        ImGui_ImplWin32_Init(hOverlay);
-
-        // Create a simple D3D11 device for the overlay
-        DXGI_SWAP_CHAIN_DESC sd={};
-        sd.BufferCount=1;
-        sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
-        sd.BufferDesc.Width=w; sd.BufferDesc.Height=h;
-        sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sd.OutputWindow=hOverlay;
-        sd.SampleDesc.Count=1;
-        sd.Windowed=TRUE;
-
-        D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0 };
-        D3D_FEATURE_LEVEL selectedLevel;
-        HRESULT hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
-            featureLevels, 1, D3D11_SDK_VERSION, &sd, &sc, &dev, &selectedLevel, &ctx);
-        if(FAILED(hr)||!dev||!sc){
-            printf("[!] Failed to create D3D device for overlay\n");
-            return false;
+                td = NULL; tc = NULL;
+                HRESULT hr = D3D11CreateDeviceAndSwapChain(NULL, types[di], NULL, 0,
+                    NULL, 0, D3D11_SDK_VERSION, &sd, &tc, &td, NULL, NULL);
+                if (SUCCEEDED(hr) && td && tc) {
+                    printf("[+] Device OK (hwnd:%p, driver:%d)\n", targets[ti], types[di]);
+                    goto HOOK_IT;
+                }
+            }
         }
 
-        ID3D11Texture2D*bb=nullptr;sc->GetBuffer(0,__uuidof(ID3D11Texture2D),(void**)&bb);
-        dev->CreateRenderTargetView(bb,nullptr,&rtv);bb->Release();
+        if (hTemp) DestroyWindow(hTemp);
+        printf("[!] Cannot create D3D11 device\n");
+        return false;
 
-        ImGui_ImplDX11_Init(dev, ctx);
-        ImGui::StyleColorsDark();
+    HOOK_IT:
+        if (hTemp) DestroyWindow(hTemp);
 
-        init=true;
-        printf("[+] Overlay window created with D3D11\n");
+        void** vt = *(void***)tc;
+        printf("[*] VTable at %p\n", vt);
 
+        orig = (Present_t)vt[8];
+        DWORD old;
+        VirtualProtect(&vt[8], 8, PAGE_READWRITE, &old);
+        vt[8] = (void*)&Hook;
+        VirtualProtect(&vt[8], 8, old, &old);
+
+        printf("[+] VTable hooked: vt[8] = %p -> %p\n", orig, vt[8]);
+
+        td->Release();
+        tc->Release();
         return true;
     }
 
-    static DWORD WINAPI RenderThread(LPVOID param){
-        D3D11Hook* hook = (D3D11Hook*)param;
+    static DWORD WINAPI RenderThread(LPVOID lp) {
         printf("[*] Render thread started\n");
-        int frameCount = 0;
-        while(hook->init){
-            Sleep(16); // ~60 FPS
-            frameCount++;
-
-            // Update overlay position to follow game window
-            RECT rect;
-            GetClientRect(hook->hGameWnd, &rect);
-            POINT pt = {0, 0};
-            ClientToScreen(hook->hGameWnd, &pt);
-            SetWindowPos(g_hWindow, HWND_TOPMOST, pt.x, pt.y, rect.right-rect.left, rect.bottom-rect.top, SWP_NOACTIVATE | SWP_NOZORDER);
-
-            if(frameCount % 60 == 0){
-                printf("[*] Rendering frame %d, window pos: %d,%d size: %dx%d\n", frameCount, pt.x, pt.y, rect.right-rect.left, rect.bottom-rect.top);
-            }
-
-            // Clear background to black (transparent due to COLORKEY)
-            float clearColor[4] = {0, 0, 0, 0};
-            hook->ctx->ClearRenderTargetView(hook->rtv, clearColor);
-
-            // Render
-            ImGui_ImplDX11_NewFrame();
-            ImGui_ImplWin32_NewFrame();
-            ImGui::NewFrame();
-
-            hook->DoESP();
-            if(cfg.menu) hook->DrawMenu();
-
-            ImGui::EndFrame();
-            ImGui::Render();
-            hook->ctx->OMSetRenderTargets(1, &hook->rtv, NULL);
-            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-
-            HRESULT hr = hook->sc->Present(1, 0);
-            if(FAILED(hr) && frameCount % 60 == 0){
-                printf("[!] Present failed: 0x%X\n", hr);
-            }
+        while (true) {
+            Sleep(1000);
         }
-        printf("[*] Render thread stopped\n");
         return 0;
     }
 };
-D3D11Hook* D3D11Hook::inst=nullptr;
+D3D11Hook* D3D11Hook::inst = nullptr;
 
 // ===================================================================
 // CONSOLE MENU (fallback when D3D hook fails)
@@ -592,15 +567,15 @@ DWORD WINAPI DelayedHookThread(HMODULE m){
     printf("[*] Waiting 5 seconds for game to initialize DirectX...\n");
     Sleep(5000);
     
-    printf("[*] Creating overlay window...\n");
+    printf("[*] Hooking D3D11 Present...\n");
     static D3D11Hook d;
     D3D11Hook::inst=&d;
     if(d.HookD3D()){
-        printf("[+] Overlay window created successfully\n");
+        printf("[+] D3D11 Present hooked successfully\n");
         printf("[*] Starting render thread...\n");
         CreateThread(NULL, 0, D3D11Hook::RenderThread, &d, 0, NULL);
     } else {
-        printf("[!] Overlay creation failed - running without ESP\n");
+        printf("[!] D3D hook failed - running without ESP\n");
         cfg.d3dHookFailed = true;
         printf("[*] Press F1 to toggle console menu\n");
         ConsoleMenu();
