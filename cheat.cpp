@@ -132,9 +132,9 @@ public:
         uint8_t p4[]={0x0F,0x11,0x05,0,0,0,0,0x0F,0x11,0x0D};
         uint8_t pCol[]={0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0xD9};
         uintptr_t a;
-        a=FindSig(p1,"xxx????x");if(a){addr_cGame=RIP(a);printf("[+] cGame: 0x%llX\n",addr_cGame);}
-        a=FindSig(p2,"xxx????xxxx");if(a){addr_cLocalPlayer=RIP(a);printf("[+] cLocalPlayer: 0x%llX\n",addr_cLocalPlayer);}
-        a=FindSig(p3,"xxx????xxxx");if(a){addr_cPlayerList=RIP(a);printf("[+] cPlayerList: 0x%llX\n",addr_cPlayerList);}
+        a=FindSig(p1,"xxx????x");if(a){addr_cGame=RIP(a);printf("[+] cGame: 0x%llX\n",addr_cGame);printf("[DEBUG SCAN] cGame pattern at %llX, resolved to %llX, offset from base: %llX, value: %llX\n", (uint64_t)a, (uint64_t)addr_cGame, (uint64_t)(addr_cGame-base), (uint64_t)(*(uintptr_t*)addr_cGame));}
+        a=FindSig(p2,"xxx????xxxx");if(a){addr_cLocalPlayer=RIP(a);printf("[+] cLocalPlayer: 0x%llX\n",addr_cLocalPlayer);printf("[DEBUG SCAN] cLocalPlayer pattern at %llX, resolved to %llX, offset from base: %llX, value: %llX\n", (uint64_t)a, (uint64_t)addr_cLocalPlayer, (uint64_t)(addr_cLocalPlayer-base), (uint64_t)(*(uintptr_t*)addr_cLocalPlayer));}
+        a=FindSig(p3,"xxx????xxxx");if(a){addr_cPlayerList=RIP(a);printf("[+] cPlayerList: 0x%llX\n",addr_cPlayerList);printf("[DEBUG SCAN] cPlayerList pattern at %llX, resolved to %llX, offset from base: %llX, value: %llX\n", (uint64_t)a, (uint64_t)addr_cPlayerList, (uint64_t)(addr_cPlayerList-base), (uint64_t)(*(uintptr_t*)addr_cPlayerList));}
         a=FindSig(p4,"xxx????xxx");if(a){addr_ViewMatrix=RIP(a);printf("[+] ViewMatrix: 0x%llX\n",addr_ViewMatrix);}
         a=FindSig(pCol,"xxxxxxxxx");if(a){colAddr=a;colSize=5;printf("[+] Collision func: 0x%llX\n",colAddr);}
         if(!colAddr){uint8_t pC2[]={0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
@@ -156,42 +156,82 @@ public:
     }
 
     Entity GetLP(){
-        Entity e;
-        printf("[DEBUG] GetLP() - addr_cGame: 0x%llX, addr_cLocalPlayer: 0x%llX\n", addr_cGame, addr_cLocalPlayer);
-        uintptr_t g=R<uintptr_t>(base+addr_cGame);
-        printf("[DEBUG] GetLP() - g ptr: 0x%llX\n", g);
-        if(!g)return e;
-        e.addr=R<uintptr_t>(g+addr_cLocalPlayer);
-        printf("[DEBUG] GetLP() - local player addr: 0x%llX\n", e.addr);
-        if(!e.addr)return e;
-        e.pos=R<Vector3>(e.addr+off_pos);e.head=R<Vector3>(e.addr+off_head);
-        e.hp=R<float>(e.addr+off_hp);e.mhp=R<float>(e.addr+off_mhp);
-        e.team=R<int>(e.addr+off_team);RB(e.addr+off_name,e.name,64);e.alive=e.hp>0.1f;
-        printf("[DEBUG] GetLP() - hp:%.0f team:%d alive:%d\n", e.hp, e.team, e.alive);
-        return e;
+        Entity lp;
+        
+        // Try direct dereference
+        uintptr_t g = R<uintptr_t>(addr_cGame);
+        printf("[DIAG LP] cGame addr=%llx, value=%llx\n", (uint64_t)addr_cGame, (uint64_t)g);
+        
+        if (!g) {
+            // Try reading the pointer directly from the pattern result
+            uintptr_t raw_ptr = *(uintptr_t*)(addr_cGame);
+            printf("[DIAG LP] raw read at cGame addr: %llx\n", (uint64_t)raw_ptr);
+            
+            // Also try: maybe the pattern actually points to the game object directly
+            printf("[DIAG LP] Trying addr_cGame as direct object...\n");
+            g = addr_cGame;
+        }
+        
+        uintptr_t lp_ptr = R<uintptr_t>(addr_cLocalPlayer);
+        printf("[DIAG LP] cLocalPlayer value=%llx\n", (uint64_t)lp_ptr);
+        
+        if (lp_ptr) {
+            lp.addr = lp_ptr;
+            lp.pos = R<Vector3>(lp_ptr + off_pos);
+            lp.head = R<Vector3>(lp_ptr + off_head);
+            lp.hp = R<float>(lp_ptr + off_hp);
+            lp.mhp = R<float>(lp_ptr + off_mhp);
+            lp.team = R<int>(lp_ptr + off_team);
+            RB(lp_ptr + off_name, lp.name, 64);
+            lp.alive = lp.hp > 0;
+        }
+        
+        return lp;
     }
 
     std::vector<Entity> GetEnts(){
-        std::vector<Entity> v;
-        printf("[DEBUG] GetEnts() - addr_cGame: 0x%llX, addr_cPlayerList: 0x%llX\n", addr_cGame, addr_cPlayerList);
-        uintptr_t g=R<uintptr_t>(base+addr_cGame);
-        printf("[DEBUG] GetEnts() - g ptr: 0x%llX\n", g);
-        if(!g)return v;
-        uintptr_t l=R<uintptr_t>(g+addr_cPlayerList);
-        printf("[DEBUG] GetEnts() - player list ptr: 0x%llX\n", l);
-        if(!l)return v;
-        int c=R<int>(l+0x8);
-        printf("[DEBUG] GetEnts() - player count: %d\n", c);
-        if(c>64||c<0)c=50;
-        for(int i=0;i<c;i++){uintptr_t a=R<uintptr_t>(l+0x10+i*8);
-            if(!a)continue;
-            Entity e;e.addr=a;e.pos=R<Vector3>(a+off_pos);e.head=R<Vector3>(a+off_head);
-            e.hp=R<float>(a+off_hp);e.mhp=R<float>(a+off_mhp);e.team=R<int>(a+off_team);
-            RB(a+off_name,e.name,64);e.alive=e.hp>0.1f;
-            printf("[DEBUG] Entity[%d] addr:0x%llX hp:%.0f team:%d alive:%d\n", i, a, e.hp, e.team, e.alive);
-            v.push_back(e);}
-        printf("[DEBUG] GetEnts() - total entities: %zu\n", v.size());
-        return v;
+        std::vector<Entity> ents;
+        
+        // Step 1: Read the cGame pointer
+        uintptr_t g = R<uintptr_t>(addr_cGame);
+        printf("[DIAG] cGame addr=%llx, value=%llx\n", (uint64_t)addr_cGame, (uint64_t)g);
+        
+        if (!g) {
+            // Try reading the pointer directly from the pattern result
+            // without ResolveRelative - use the address of the lea instruction itself
+            uintptr_t raw_ptr = *(uintptr_t*)(addr_cGame);
+            printf("[DIAG] raw read at cGame addr: %llx\n", (uint64_t)raw_ptr);
+            
+            // Also try: maybe the pattern actually points to the game object directly
+            // and doesn't need dereferencing
+            printf("[DIAG] Trying addr_cGame as direct object...\n");
+            g = addr_cGame;
+        }
+        
+        // Step 2: Read cPlayerList from the game object
+        uintptr_t pl = R<uintptr_t>(g + 0xB8);  // common offset for player list
+        printf("[DIAG] playerList from game+0xB8=%llx\n", (uint64_t)pl);
+        
+        // Step 3: Try the cPlayerList address directly too
+        uintptr_t pl_direct = R<uintptr_t>(addr_cPlayerList);
+        printf("[DIAG] cPlayerList value (direct)=%llx\n", (uint64_t)pl_direct);
+        
+        // Try alternate: maybe cPlayerList IS the list, not a pointer to it
+        printf("[DIAG] addr_cPlayerList itself=%llx\n", (uint64_t)addr_cPlayerList);
+        
+        // If cPlayerList has a valid value, try reading entities from it
+        uintptr_t list_base = pl_direct ? pl_direct : pl;
+        if (list_base) {
+            int count = R<int>(list_base + 0x8);  // count at offset 8?
+            printf("[DIAG] list count = %d\n", count);
+            
+            for (int i = 0; i < min(count, 50); i++) {
+                uintptr_t ent_ptr = R<uintptr_t>(list_base + i * 0x8);
+                printf("[DIAG] ent[%d] ptr = %llx\n", i, (uint64_t)ent_ptr);
+            }
+        }
+        
+        return ents;
     }
 
     XMMATRIX GetVM(){XMMATRIX m;RB(addr_ViewMatrix,&m,sizeof(m));return m;}
