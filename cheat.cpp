@@ -109,12 +109,13 @@ public:
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
 
-    // PROPER ResolveRelative — matches what offset dumper does
+    // PROPER ResolveRelative — matches what offset dumper does exactly
     uintptr_t ResolveRelative(uintptr_t addr, int disp_offset, int inst_len) {
         if (!addr) return 0;
         __try {
             int32_t disp = *(int32_t*)(addr + disp_offset);
-            return addr + inst_len + disp;
+            // Offset dumper formula: address + (disp + offset) + sizeof(int)
+            return addr + disp + disp_offset + 4;
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             return 0;
         }
