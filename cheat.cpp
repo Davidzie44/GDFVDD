@@ -67,157 +67,179 @@ public:
     uintptr_t addr_cPlayerList = 0;
     uintptr_t addr_ViewMatrix = 0;
     uintptr_t addr_Collision = 0;
-    uintptr_t pGame = 0;       // the actual pointer value read from addr_cGame
 
-    // Offsets (may need tuning)
     uintptr_t pos_off = 0x80;
     uintptr_t hp_off = 0xC0;
     uintptr_t team_off = 0xD0;
     uintptr_t name_off = 0x100;
     uintptr_t head_off = 0x8C;
     uintptr_t mhp_off = 0xC4;
-    uintptr_t ang_off = 0x1A0;
 
     uint8_t colOrig[32]; int colSize=0; bool colSaved=false;
-    uintptr_t colAddr=0; // Made public for menu display
+    uintptr_t colAddr=0;
 
-    // Memory helpers
+    // SAFE memory read with exception handling
     template<typename T>
     T Read(uintptr_t addr) {
-        if (!addr) return T{};
-        T val;
-        if (ReadProcessMemory(GetCurrentProcess(), (LPCVOID)addr, &val, sizeof(T), NULL))
-            return val;
-        return T{};
+        T val = T{};
+        if (!addr || IsBadReadPtr((void*)addr, sizeof(T))) return val;
+        __try {
+            val = *(T*)addr;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            val = T{};
+        }
+        return val;
     }
 
     void ReadBuffer(uintptr_t addr, void* buf, size_t sz) {
-        if (addr)
-            ReadProcessMemory(GetCurrentProcess(), (LPCVOID)addr, buf, sz, NULL);
+        if (!addr || IsBadReadPtr((void*)addr, sz)) return;
+        __try {
+            memcpy(buf, (void*)addr, sz);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
 
     template<typename T>
     void Write(uintptr_t addr, T val) {
-        if (addr)
-            WriteProcessMemory(GetCurrentProcess(), (LPVOID)addr, &val, sizeof(T), NULL);
-    }
-
-    void WriteBytes(uintptr_t addr, const uint8_t* data, size_t len) {
         if (!addr) return;
         DWORD old;
-        VirtualProtect((void*)addr, len, PAGE_EXECUTE_READWRITE, &old);
-        memcpy((void*)addr, data, len);
-        VirtualProtect((void*)addr, len, old, &old);
+        __try {
+            VirtualProtect((void*)addr, sizeof(T), PAGE_EXECUTE_READWRITE, &old);
+            *(T*)addr = val;
+            VirtualProtect((void*)addr, sizeof(T), old, &old);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
 
-    // FIXED ResolveRelative
-    uintptr_t ResolveRelative(uintptr_t addr, int offset = 3, int inst_len = 7) {
-        int32_t disp = *(int32_t*)(addr + offset);
-        return addr + inst_len + (int64_t)disp;
+    // PROPER ResolveRelative — matches what offset dumper does
+    uintptr_t ResolveRelative(uintptr_t addr, int disp_offset, int inst_len) {
+        if (!addr) return 0;
+        __try {
+            int32_t disp = *(int32_t*)(addr + disp_offset);
+            return addr + inst_len + disp;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            return 0;
+        }
     }
 
-    // Pattern scan
+    // SAFE pattern scan — uses VirtualQuery to avoid unmapped memory
     uintptr_t FindPattern(const char* pattern) {
-        static auto patternToBytes = [](const char* pat) -> std::vector<int> {
-            std::vector<int> bytes;
-            auto start = const_cast<char*>(pat);
-            auto end = start + strlen(pat);
-            for (auto c = start; c < end; ++c) {
-                if (*c == '?') { ++c; if (*c == '?') ++c; bytes.push_back(-1); }
-                else bytes.push_back((int)strtoul(c, &c, 16));
+        // Parse pattern
+        std::vector<int> bytes;
+        auto start = const_cast<char*>(pattern);
+        auto end = start + strlen(pattern);
+        for (auto c = start; c < end; ++c) {
+            if (*c == '?') {
+                ++c; if (*c == '?') ++c;
+                bytes.push_back(-1);
+            } else {
+                bytes.push_back((int)strtoul(c, &c, 16));
             }
-            return bytes;
-        };
+        }
 
-        auto bytes = patternToBytes(pattern);
-        auto sz = bytes.size();
-        auto data = bytes.data();
+        size_t sz = bytes.size();
+        int* data = bytes.data();
 
-        for (uintptr_t i = 0; i < 0x20000000; i++) {  // scan 512MB
-            bool found = true;
-            for (size_t j = 0; j < sz; j++) {
-                if (data[j] != -1 && *(uint8_t*)(base + i + j) != (uint8_t)data[j]) {
-                    found = false;
-                    break;
+        // Use VirtualQuery to scan only mapped memory
+        uintptr_t maxAddr = base + 0x20000000;
+        uintptr_t current = base;
+
+        while (current < maxAddr) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery((void*)current, &mbi, sizeof(mbi)))
+                break;
+
+            if (mbi.State == MEM_COMMIT && 
+                (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
+                
+                uintptr_t regionStart = (uintptr_t)mbi.BaseAddress;
+                uintptr_t regionEnd = regionStart + mbi.RegionSize;
+                
+                for (uintptr_t i = regionStart; i < regionEnd - sz; ++i) {
+                    bool found = true;
+                    for (size_t j = 0; j < sz; ++j) {
+                        if (data[j] != -1 && *(uint8_t*)(i + j) != (uint8_t)data[j]) {
+                            found = false;
+                            break;
+                        }
+                    }
+                    if (found) return i;
                 }
             }
-            if (found) return base + i;
+            current += mbi.RegionSize;
         }
         return 0;
     }
 
     bool ScanAll() {
         base = (uintptr_t)GetModuleHandleA("aces.exe");
-        if (!base) base = (uintptr_t)GetModuleHandleA(NULL);
+        if (!base) {
+            printf("[!] aces.exe not found, trying base module\n");
+            base = (uintptr_t)GetModuleHandleA(NULL);
+        }
+        if (!base) { printf("[!] No module base found\n"); return false; }
         printf("[+] Base: 0x%llX\n", (uint64_t)base);
 
-        uintptr_t pat;
-
         // cGame: 48 8B 05 ? ? ? ? F2 0F 10 4F 08
-        pat = FindPattern("48 8B 05 ? ? ? ? F2 0F 10 4F 08");
+        uintptr_t pat = FindPattern("48 8B 05 ? ? ? ? F2 0F 10 4F 08");
         if (pat) {
             addr_cGame = ResolveRelative(pat, 3, 7);
-            printf("[+] cGame: 0x%llX\n", (uint64_t)addr_cGame);
+            printf("[+] cGame: pat=0x%llX resolved=0x%llX\n", (uint64_t)pat, (uint64_t)addr_cGame);
+        } else {
+            printf("[!] cGame pattern not found\n");
         }
 
         // cLocalPlayer: 48 8B 2D ? ? ? ? 48 85 ED 74 ? F6 85
         pat = FindPattern("48 8B 2D ? ? ? ? 48 85 ED 74 ? F6 85");
         if (pat) {
             addr_cLocalPlayer = ResolveRelative(pat, 3, 7);
-            printf("[+] cLocalPlayer: 0x%llX\n", (uint64_t)addr_cLocalPlayer);
+            printf("[+] cLocalPlayer: pat=0x%llX resolved=0x%llX\n", (uint64_t)pat, (uint64_t)addr_cLocalPlayer);
+        } else {
+            printf("[!] cLocalPlayer pattern not found\n");
         }
 
-        // cPlayerList: try multiple patterns
-        pat = FindPattern("48 8B 0D ? ? ? ? 89 C0 48 8B 1C C1 48 85 DB");
-        if (!pat)
-            pat = FindPattern("48 8B 0D ? ? ? ? 48 8B 1C C1 48 85 DB");
+        // cPlayerList: 48 8B 0D ? ? ? ? 48 8B 1C C1 48 85 DB
+        pat = FindPattern("48 8B 0D ? ? ? ? 48 8B 1C C1 48 85 DB");
+        if (!pat) pat = FindPattern("48 8B 0D ? ? ? ? 89 C0 48 8B 1C C1 48 85 DB");
         if (pat) {
             addr_cPlayerList = ResolveRelative(pat, 3, 7);
-            printf("[+] cPlayerList: 0x%llX\n", (uint64_t)addr_cPlayerList);
+            printf("[+] cPlayerList: pat=0x%llX resolved=0x%llX\n", (uint64_t)pat, (uint64_t)addr_cPlayerList);
+        } else {
+            printf("[!] cPlayerList pattern not found\n");
         }
 
         // ViewMatrix: 48 8D 0D ? ? ? ? FF 15 ? ? ? ? 0F 28 05
         pat = FindPattern("48 8D 0D ? ? ? ? FF 15 ? ? ? ? 0F 28 05");
         if (pat) {
             addr_ViewMatrix = ResolveRelative(pat, 3, 7);
-            printf("[+] ViewMatrix: 0x%llX\n", (uint64_t)addr_ViewMatrix);
+            printf("[+] ViewMatrix: pat=0x%llX resolved=0x%llX\n", (uint64_t)pat, (uint64_t)addr_ViewMatrix);
+        } else {
+            printf("[!] ViewMatrix pattern not found\n");
         }
 
         // Collision func
-        pat = FindPattern("40 53 48 83 EC 20 48 8B D9");
+        pat = FindPattern("40 53 48 83 EC 20 48 8B D9 48 8B 0D ? ? ? ? 48 85 C9");
         if (pat) {
-            colAddr = pat;
-            colSize = 5;
-            printf("[+] Collision func: 0x%llX\n", (uint64_t)colAddr);
+            addr_Collision = pat;
+            printf("[+] Collision func: 0x%llX\n", (uint64_t)pat);
         }
 
-        printf("[*] pos:0x%llX hp:0x%llX team:0x%llX name:0x%llX\n",
-               (uint64_t)pos_off, (uint64_t)hp_off, (uint64_t)team_off, (uint64_t)name_off);
+        // Debug: show what's at each resolved address
+        uint64_t v_cGame = Read<uint64_t>(addr_cGame);
+        uint64_t v_cLP = Read<uint64_t>(addr_cLocalPlayer);
+        uint64_t v_cPL = Read<uint64_t>(addr_cPlayerList);
+        printf("[DEBUG] cGame => 0x%llX\n", v_cGame);
+        printf("[DEBUG] cLocalPlayer => 0x%llX\n", v_cLP);
+        printf("[DEBUG] cPlayerList => 0x%llX\n", v_cPL);
 
-        // Debug: print the actual values at the resolved addresses
-        uint64_t cGame_val = Read<uint64_t>(addr_cGame);
-        uint64_t cLP_val = Read<uint64_t>(addr_cLocalPlayer);
-        uint64_t cPL_val = Read<uint64_t>(addr_cPlayerList);
-        printf("[DEBUG] cGame value = 0x%llX\n", cGame_val);
-        printf("[DEBUG] cLocalPlayer value = 0x%llX\n", cLP_val);
-        printf("[DEBUG] cPlayerList value = 0x%llX\n", cPL_val);
-
-        return addr_cGame && addr_cLocalPlayer && addr_cPlayerList;
+        return true;
     }
 
     Entity GetLP() {
         Entity lp;
-        pGame = Read<uintptr_t>(addr_cGame);
-        if (!pGame) {
-            printf("[WARN] cGame pointer is NULL\n");
-            return lp;
-        }
+        uintptr_t g = Read<uintptr_t>(addr_cGame);
+        if (!g) { return lp; }
 
         uintptr_t lp_addr = Read<uintptr_t>(addr_cLocalPlayer);
-        if (!lp_addr) {
-            printf("[WARN] cLocalPlayer pointer is NULL\n");
-            return lp;
-        }
+        if (!lp_addr) { return lp; }
 
         lp.addr = lp_addr;
         lp.pos = Read<Vector3>(lp_addr + pos_off);
@@ -226,45 +248,29 @@ public:
         lp.mhp = Read<float>(lp_addr + mhp_off);
         lp.team = Read<int>(lp_addr + team_off);
         ReadBuffer(lp_addr + name_off, lp.name, 64);
-        lp.alive = (lp.hp > 0.0f && lp.hp < 99999.0f);
+        lp.alive = (lp.hp > 0.0f && lp.hp < 50000.0f);
         return lp;
     }
 
     std::vector<Entity> GetEnts() {
         std::vector<Entity> ents;
-        pGame = Read<uintptr_t>(addr_cGame);
-        if (!pGame) return ents;
+        uintptr_t g = Read<uintptr_t>(addr_cGame);
+        if (!g) return ents;
 
-        uintptr_t plist_addr = Read<uintptr_t>(addr_cPlayerList);
-        if (!plist_addr) {
-            printf("[WARN] cPlayerList pointer is NULL\n");
+        uintptr_t plist = Read<uintptr_t>(addr_cPlayerList);
+        if (!plist) return ents;
+
+        // Try reading the entity list structure
+        // Usually: plist points to { uintptr_t* array; int count; ... }
+        uintptr_t entArray = Read<uintptr_t>(plist);
+        int count = Read<int>(plist + 0x8);
+
+        if (!entArray || count <= 0 || count > 100) {
             return ents;
         }
 
-        // The entity list structure at plist_addr:
-        // [0x00]: pointer to array of entity pointers
-        // [0x08]: count (int32)
-        uintptr_t ent_array = Read<uintptr_t>(plist_addr);
-        int count = Read<int>(plist_addr + 0x8);
-
-        if (!ent_array || count <= 0 || count > 100) {
-            // Try alternate: plist_addr itself is the entity array start
-            // with count at offset 0x8
-            ent_array = plist_addr;
-            count = Read<int>(plist_addr + 0x8);
-            if (!ent_array || count <= 0 || count > 100) {
-                return ents;
-            }
-            // ent_array is actually the whole struct, entities at offset 0
-            ent_array = Read<uintptr_t>(plist_addr);
-            count = Read<int>(plist_addr + 0x8);
-            if (!ent_array || count <= 0 || count > 100)
-                return ents;
-        }
-
         for (int i = 0; i < min(count, 64); i++) {
-            // Each entity slot holds a pointer to the entity
-            uintptr_t e_ptr = Read<uintptr_t>(ent_array + (uintptr_t)i * 0x8);
+            uintptr_t e_ptr = Read<uintptr_t>(entArray + (uintptr_t)i * 8);
             if (!e_ptr) continue;
 
             Entity e;
@@ -275,10 +281,9 @@ public:
             e.mhp = Read<float>(e_ptr + mhp_off);
             e.team = Read<int>(e_ptr + team_off);
             ReadBuffer(e_ptr + name_off, e.name, 64);
-            e.alive = (e.hp > 0.0f && e.hp < 99999.0f);
+            e.alive = (e.hp > 0.0f && e.hp < 50000.0f);
             ents.push_back(e);
         }
-
         return ents;
     }
 
@@ -310,21 +315,37 @@ public:
     }
 
     void SetAng(Vector2 ang) {
-        // Try to find the view angle address
-        if (!pGame) return;
-        // Common view angle offsets from cGame
-        uintptr_t viewAngAddr = pGame + 0x2C0;  // may need tuning
-        Write<float>(viewAngAddr, ang.y);      // pitch (y)
-        Write<float>(viewAngAddr + 0x4, ang.x); // yaw (x)
+        uintptr_t g = Read<uintptr_t>(addr_cGame);
+        if (!g) return;
+        // Try common offsets for view angles from game object
+        // Offset 0x2C0 often works for pitch/yaw
+        Write<float>(g + 0x2C0, ang.y);
+        Write<float>(g + 0x2C4, ang.x);
     }
 
     void EnableWallbang(){
         if(!colAddr){printf("[!] No collision func found\n");return;}
         if(!colSaved){ReadBuffer(colAddr,colOrig,colSize);colSaved=true;}
-        uint8_t nops[32];memset(nops,0x90,colSize);WriteBytes(colAddr,nops,colSize);
+        uint8_t nops[32];memset(nops,0x90,colSize);
+        DWORD old;
+        __try {
+            VirtualProtect((void*)colAddr, colSize, PAGE_EXECUTE_READWRITE, &old);
+            memcpy((void*)colAddr, nops, colSize);
+            VirtualProtect((void*)colAddr, colSize, old, &old);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
         printf("[+] Wallbang ON\n");
     }
-    void DisableWallbang(){if(colAddr&&colSaved)WriteBytes(colAddr,colOrig,colSize);printf("[-] Wallbang OFF\n");}
+    void DisableWallbang(){
+        if(colAddr&&colSaved){
+            DWORD old;
+            __try {
+                VirtualProtect((void*)colAddr, colSize, PAGE_EXECUTE_READWRITE, &old);
+                memcpy((void*)colAddr, colOrig, colSize);
+                VirtualProtect((void*)colAddr, colSize, old, &old);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        printf("[-] Wallbang OFF\n");
+    }
 };
 GameMemory gMem;
 
