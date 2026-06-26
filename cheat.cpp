@@ -351,94 +351,79 @@ public:
     }
 
     bool HookD3D(){
-        HWND hwnd = NULL;
-        ID3D11Device*td=nullptr; IDXGISwapChain*tc=nullptr;
+        // Find game window first
+        HWND hGameWnd = NULL;
+        for(int i=0; i<100; i++){
+            hGameWnd = FindWindowW(L"SDL_app", NULL);
+            if(!hGameWnd) hGameWnd = FindWindowW(NULL, L"War Thunder");
+            if(!hGameWnd) EnumWindows([](HWND h, LPARAM lp)->BOOL{
+                wchar_t cls[64]; GetClassNameW(h,cls,64);
+                if(wcsstr(cls,L"SDL")||wcsstr(cls,L"d3d")||wcsstr(cls,L"Win32")){
+                    DWORD pid; GetWindowThreadProcessId(h,&pid);
+                    if(pid==GetCurrentProcessId()){*(HWND*)lp=h;return FALSE;}
+                } return TRUE;
+            }, (LPARAM)&hGameWnd);
+            if(hGameWnd) break;
+            Sleep(50);
+        }
+        printf("[+] Game window: 0x%llX\n", (uintptr_t)hGameWnd);
 
-        for(int attempt=0; attempt<5; attempt++){
-            // Create a real hidden window (NOT GetDesktopWindow)
-            hwnd = CreateWindowExA(0, "STATIC", "d3d", WS_POPUP, 0, 0, 1, 1, NULL, NULL, NULL, NULL);
-            if(!hwnd) hwnd = GetDesktopWindow();
+        // Create temp BUTTON class window (always registered)
+        HWND hTemp = CreateWindowExA(0, "BUTTON", "", WS_POPUP, 0, 0, 1, 1, NULL, NULL, NULL, NULL);
 
-            DXGI_SWAP_CHAIN_DESC sd={};
-            sd.BufferCount=1;
-            sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
-            sd.BufferDesc.Width=1; sd.BufferDesc.Height=1;
-            sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
-            sd.OutputWindow=hwnd;
-            sd.SampleDesc.Count=1;
-            sd.Windowed=TRUE;
+        ID3D11Device* td = NULL;
+        IDXGISwapChain* tc = NULL;
 
-            D3D_DRIVER_TYPE types[]={D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
-                                      D3D_DRIVER_TYPE_REFERENCE, D3D_DRIVER_TYPE_SOFTWARE};
-            for(int i=0;i<4;i++){
-                td=nullptr; tc=nullptr;
-                HRESULT hr = D3D11CreateDeviceAndSwapChain(NULL, types[i], NULL, 0,
+        // Try game window first, then temp, then desktop
+        HWND targets[] = { hGameWnd, hTemp, GetDesktopWindow() };
+        D3D_DRIVER_TYPE types[] = { D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
+                                     D3D_DRIVER_TYPE_REFERENCE, D3D_DRIVER_TYPE_SOFTWARE };
+
+        for(int ti=0; ti<3; ti++){
+            if(!targets[ti]) continue;
+            for(int di=0; di<4; di++){
+                DXGI_SWAP_CHAIN_DESC sd={};
+                sd.BufferCount=1;
+                sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+                sd.BufferDesc.Width=1; sd.BufferDesc.Height=1;
+                sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
+                sd.OutputWindow=targets[ti];
+                sd.SampleDesc.Count=1;
+                sd.Windowed=TRUE;
+
+                td=NULL; tc=NULL;
+                HRESULT hr = D3D11CreateDeviceAndSwapChain(NULL, types[di], NULL, 0,
                     NULL, 0, D3D11_SDK_VERSION, &sd, &tc, &td, NULL, NULL);
                 if(SUCCEEDED(hr) && td && tc){
-                    printf("[+] Device created with driver type %d\n", types[i]);
-                    break;
-                }
-            }
-
-            if(td && tc){
-                void**vt=*(void***)tc; orig=(P_t)vt[8];
-                printf("[*] Present vtable entry at %p, orig=%p\n", &vt[8], orig);
-                DWORD old; VirtualProtect(&vt[8],8,PAGE_READWRITE,&old);
-                vt[8]=(void*)&D3D11Hook::Hook;
-                VirtualProtect(&vt[8],8,old,&old);
-                printf("[+] VTable patched: %p -> %p\n", orig, vt[8]);
-                td->Release(); tc->Release();
-                if(hwnd && hwnd!=GetDesktopWindow()) DestroyWindow(hwnd);
-                return true;
-            }
-
-            if(hwnd && hwnd!=GetDesktopWindow()) DestroyWindow(hwnd);
-            printf("[*] Attempt %d failed, retrying...\n", attempt+1);
-            Sleep(500);
-        }
-
-        // ===== FALLBACK: Direct detour on dxgi!Present =====
-        printf("[*] Fallback: searching for Present in dxgi.dll...\n");
-        uintptr_t dxgiBase = 0;
-        HANDLE ss=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,GetCurrentProcessId());
-        MODULEENTRY32W me={sizeof(MODULEENTRY32W)};
-        if(Module32FirstW(ss,&me)) do if(_wcsicmp(me.szModule,L"dxgi.dll")==0){dxgiBase=(uintptr_t)me.modBaseAddr;break;}while(Module32NextW(ss,&me));
-        CloseHandle(ss);
-
-        if(dxgiBase){
-            printf("[*] dxgi.dll base: 0x%llX\n", dxgiBase);
-            // Scan for Present function prologue in dxgi
-            // Typical Present starts with: 48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20
-            uint8_t pat[]={0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
-            auto dos=(IMAGE_DOS_HEADER*)dxgiBase;
-            auto nt=(IMAGE_NT_HEADERS*)(dxgiBase+dos->e_lfanew);
-            auto sec=IMAGE_FIRST_SECTION(nt);
-            for(WORD i=0;i<nt->FileHeader.NumberOfSections;i++){
-                char sn[9]={};memcpy(sn,sec[i].Name,8);
-                if(strcmp(sn,".text")==0){
-                    uintptr_t st=dxgiBase+sec[i].VirtualAddress;
-                    size_t sz=sec[i].Misc.VirtualSize;
-                    for(size_t j=0;j<sz-15;j++){
-                        if(memcmp((void*)(st+j),pat,15)==0){
-                            printf("[+] Found Present function at 0x%llX\n", st+j);
-                            // Write a jmp hook
-                            uint8_t jmp[14]={0xFF,0x25,0x00,0x00,0x00,0x00}; // jmp [rip+0]
-                            *(uintptr_t*)&jmp[6]=(uintptr_t)&D3D11Hook::Hook;
-                            DWORD old; VirtualProtect((LPVOID)(st+j),14,PAGE_EXECUTE_READWRITE,&old);
-                            uint8_t save[14]; memcpy(save,(void*)(st+j),14); // save for orig
-                            orig = (P_t)(st+j+14+*(int*)(st+j+10)); // wrong, but close
-                            memcpy((void*)(st+j),jmp,14);
-                            VirtualProtect((LPVOID)(st+j),14,old,&old);
-                            printf("[+] Present hooked via detour\n");
-                            return true;
-                        }
-                    }
+                    printf("[+] Device OK (hwnd:%p, driver:%d)\n", targets[ti], types[di]);
+                    goto HOOK_IT;
                 }
             }
         }
 
-        printf("[!] All hook methods failed\n");
+        if(hTemp) DestroyWindow(hTemp);
+        printf("[!] Cannot create D3D11 device\n");
         return false;
+
+HOOK_IT:
+        if(hTemp) DestroyWindow(hTemp);
+        // Keep tc alive for vtable access
+
+        void** vt = *(void***)tc;
+        printf("[*] VTable at %p\n", vt);
+        for(int vi=0; vi<12; vi++) printf("  vt[%d] = %p\n", vi, vt[vi]);
+
+        orig = (P_t)vt[8];
+        DWORD old;
+        VirtualProtect(&vt[8], 8, PAGE_READWRITE, &old);
+        vt[8] = (void*)&D3D11Hook::Hook;
+        VirtualProtect(&vt[8], 8, old, &old);
+
+        printf("[+] VTable hooked: vt[8] = %p -> %p\n", orig, vt[8]);
+
+        td->Release();
+        tc->Release();
+        return true;
     }
 };
 D3D11Hook* D3D11Hook::inst=nullptr;
