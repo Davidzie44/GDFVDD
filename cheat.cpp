@@ -74,6 +74,7 @@ public:
     uintptr_t name_off = 0x100;
     uintptr_t head_off = 0x8C;
     uintptr_t mhp_off = 0xC4;
+    uintptr_t count_off = 0x8;  // PlayerList count offset
 
     uint8_t colOrig[32]; int colSize=0; bool colSaved=false;
     uintptr_t colAddr=0;
@@ -214,6 +215,20 @@ public:
         if (v_cGame && v_cPL) {
             printf("[*] Auto-detecting entity offsets...\n");
             uintptr_t plist = v_cPL;
+            
+            // First, detect PlayerList structure to find count offset
+            uint8_t plistBuf[0x100];
+            ReadBuffer(plist, plistBuf, 0x100);
+            int countOff = 0;
+            for (int off = 0; off < 0x100; off += 4) {
+                int v = *(int*)&plistBuf[off];
+                if (v > 0 && v < 100) {  // Reasonable player count
+                    countOff = off;
+                    printf("[+] Found PlayerList count offset: 0x%X (value: %d)\n", off, v);
+                    break;
+                }
+            }
+            
             uintptr_t entArray = Read<uintptr_t>(plist);
             
             // Try to find first entity
@@ -315,9 +330,9 @@ public:
         // Try reading the entity list structure
         // Usually: plist points to { uintptr_t* array; int count; ... }
         uintptr_t entArray = Read<uintptr_t>(plist);
-        int count = Read<int>(plist + 0x8);
+        int count = Read<int>(plist + count_off);
 
-        if (frame % 60 == 0) printf("[GAME] PlayerList: array=0x%llX count=%d\n", (uint64_t)entArray, count);
+        if (frame % 60 == 0) printf("[GAME] PlayerList: array=0x%llX count=%d (off=0x%X)\n", (uint64_t)entArray, count, count_off);
 
         if (!entArray || count <= 0 || count > 100) {
             return ents;
