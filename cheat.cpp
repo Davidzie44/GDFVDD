@@ -210,6 +210,58 @@ public:
         printf("[DEBUG] cLocalPlayer => 0x%llX\n", v_cLP);
         printf("[DEBUG] cPlayerList => 0x%llX\n", v_cPL);
 
+        // Auto-detect entity field offsets
+        if (v_cGame && v_cPL) {
+            printf("[*] Auto-detecting entity offsets...\n");
+            uintptr_t plist = v_cPL;
+            uintptr_t entArray = Read<uintptr_t>(plist);
+            
+            // Try to find first entity
+            for (int i = 0; i < 64; i++) {
+                uintptr_t e = Read<uintptr_t>(entArray + i * 8);
+                if (e && e > 0x10000 && e < 0x7FFFFFFFFFFF) {
+                    uint8_t buf[0x400];
+                    ReadBuffer(e, buf, 0x400);
+                    
+                    // Find HP (float around 100)
+                    for (int off = 0; off < 0x200; off += 4) {
+                        float f = *(float*)&buf[off];
+                        if (f > 0 && f < 10000 && f == (int)f) {
+                            hp_off = off;
+                            printf("[+] Found hp offset: 0x%X (value: %.0f)\n", off, f);
+                            break;
+                        }
+                    }
+                    
+                    // Find team (small integer 0-5)
+                    for (int off = 0; off < 0x200; off += 4) {
+                        int v = *(int*)&buf[off];
+                        if (v >= 0 && v <= 5) {
+                            team_off = off;
+                            printf("[+] Found team offset: 0x%X (value: %d)\n", off, v);
+                            break;
+                        }
+                    }
+                    
+                    // Find position (3 floats with reasonable values)
+                    for (int off = 0; off < 0x200; off += 4) {
+                        float f1 = *(float*)&buf[off];
+                        float f2 = *(float*)&buf[off + 4];
+                        float f3 = *(float*)&buf[off + 8];
+                        if (fabs(f1) > 10 && fabs(f1) < 100000 &&
+                            fabs(f2) > 10 && fabs(f2) < 100000 &&
+                            fabs(f3) > 0 && fabs(f3) < 10000) {
+                            pos_off = off;
+                            printf("[+] Found pos offset: 0x%X (%.1f, %.1f, %.1f)\n", off, f1, f2, f3);
+                            break;
+                        }
+                    }
+                    
+                    break;
+                }
+            }
+        }
+
         return addr_cGame && addr_cLocalPlayer && addr_cPlayerList;
     }
 
