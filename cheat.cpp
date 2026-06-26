@@ -48,6 +48,7 @@ struct Config {
     bool trig=false; float trigFov=12.0f; int trigMin=15,trigMax=35;
     bool wb=false; float penMult=20.0f;
     bool menu=true;
+    bool enableHook=false; // Safe mode - disable D3D hook to test DLL loading
 }cfg;
 
 const char* aimKeys[] = {"Left Mouse", "Right Mouse", "Middle Mouse", "X1 Mouse", "X2 Mouse"};
@@ -498,10 +499,16 @@ DWORD WINAPI GameThread(HMODULE m){
 DWORD WINAPI Main(HMODULE m){
     AllocConsole();FILE*f;freopen_s(&f,"CONOUT$","w",stdout);
     printf("=== WT Research Tool v3.0 (ImGui) ===\n");
+    printf("[*] Safe mode (no D3D hook): %s\n", cfg.enableHook ? "OFF" : "ON");
+    
     if(!gMem.ScanAll()) printf("[!] Some offsets not found\n");
 
-    D3D11Hook d;D3D11Hook::inst=&d;
-    if(d.HookD3D()) printf("[+] D3D11 + ImGui ready\n"); else printf("[!] Hook failed\n");
+    if(cfg.enableHook){
+        D3D11Hook d;D3D11Hook::inst=&d;
+        if(d.HookD3D()) printf("[+] D3D11 + ImGui ready\n"); else printf("[!] Hook failed\n");
+    } else {
+        printf("[*] D3D hook disabled - running in safe mode\n");
+    }
 
     CreateThread(0,0,(LPTHREAD_START_ROUTINE)GameThread,m,0,0);
     return 0;
