@@ -215,11 +215,20 @@ public:
 
     Entity GetLP() {
         Entity lp;
+        static int frame = 0;
+        frame++;
+        
         uintptr_t g = Read<uintptr_t>(addr_cGame);
-        if (!g) { return lp; }
+        if (!g) { 
+            if (frame % 60 == 0) printf("[GAME] cGame is NULL\n");
+            return lp; 
+        }
 
         uintptr_t lp_addr = Read<uintptr_t>(addr_cLocalPlayer);
-        if (!lp_addr) { return lp; }
+        if (!lp_addr) { 
+            if (frame % 60 == 0) printf("[GAME] Local player is NULL\n");
+            return lp; 
+        }
 
         lp.addr = lp_addr;
         lp.pos = Read<Vector3>(lp_addr + pos_off);
@@ -229,21 +238,34 @@ public:
         lp.team = Read<int>(lp_addr + team_off);
         ReadBuffer(lp_addr + name_off, lp.name, 64);
         lp.alive = (lp.hp > 0.0f && lp.hp < 50000.0f);
+        
+        if (frame % 60 == 0) printf("[GAME] LP: hp=%.0f team=%d alive=%d\n", lp.hp, lp.team, lp.alive);
         return lp;
     }
 
     std::vector<Entity> GetEnts() {
         std::vector<Entity> ents;
+        static int frame = 0;
+        frame++;
+        
         uintptr_t g = Read<uintptr_t>(addr_cGame);
-        if (!g) return ents;
+        if (!g) {
+            if (frame % 60 == 0) printf("[GAME] cGame is NULL in GetEnts\n");
+            return ents;
+        }
 
         uintptr_t plist = Read<uintptr_t>(addr_cPlayerList);
-        if (!plist) return ents;
+        if (!plist) {
+            if (frame % 60 == 0) printf("[GAME] PlayerList is NULL\n");
+            return ents;
+        }
 
         // Try reading the entity list structure
         // Usually: plist points to { uintptr_t* array; int count; ... }
         uintptr_t entArray = Read<uintptr_t>(plist);
         int count = Read<int>(plist + 0x8);
+
+        if (frame % 60 == 0) printf("[GAME] PlayerList: array=0x%llX count=%d\n", (uint64_t)entArray, count);
 
         if (!entArray || count <= 0 || count > 100) {
             return ents;
@@ -264,6 +286,8 @@ public:
             e.alive = (e.hp > 0.0f && e.hp < 50000.0f);
             ents.push_back(e);
         }
+        
+        if (frame % 60 == 0) printf("[GAME] Found %zu entities\n", ents.size());
         return ents;
     }
 
