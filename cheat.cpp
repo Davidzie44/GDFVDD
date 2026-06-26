@@ -61,206 +61,270 @@ int aimKeyCodes[] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON
 // ===================================================================
 class GameMemory {
 public:
-    HANDLE p;
     uintptr_t base = 0;
     uintptr_t addr_cGame = 0;
     uintptr_t addr_cLocalPlayer = 0;
     uintptr_t addr_cPlayerList = 0;
     uintptr_t addr_ViewMatrix = 0;
-    uintptr_t addr_CollisionFunc = 0;
+    uintptr_t addr_Collision = 0;
+    uintptr_t pGame = 0;       // the actual pointer value read from addr_cGame
 
-    // Entity field offsets (scanned from game)
-    uint32_t off_pos = 0x80;
-    uint32_t off_hp = 0xC0;
-    uint32_t off_team = 0xD0;
-    uint32_t off_name = 0x100;
-    uint32_t off_alive = 0x2C8;
-    uint32_t off_mhp = 0xC4;
-    uint32_t off_head = 0x8C;
-    uint32_t off_playerList = 0x408;
-    uint32_t off_playerCount = 0x410;
-    uint32_t off_ang = 0x1A0;
+    // Offsets (may need tuning)
+    uintptr_t pos_off = 0x80;
+    uintptr_t hp_off = 0xC0;
+    uintptr_t team_off = 0xD0;
+    uintptr_t name_off = 0x100;
+    uintptr_t head_off = 0x8C;
+    uintptr_t mhp_off = 0xC4;
+    uintptr_t ang_off = 0x1A0;
 
-    float viewMatrix[16] = {};
     uint8_t colOrig[32]; int colSize=0; bool colSaved=false;
-
     uintptr_t colAddr=0; // Made public for menu display
 
-    GameMemory():p(GetCurrentProcess()){}
-    uintptr_t GetMod(const wchar_t* n){
-        HANDLE s=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,GetCurrentProcessId());
-        MODULEENTRY32W e={sizeof(MODULEENTRY32W)};
-        if(Module32FirstW(s,&e)) do if(_wcsicmp(e.szModule,n)==0){CloseHandle(s);return(uintptr_t)e.modBaseAddr;}while(Module32NextW(s,&e));
-        CloseHandle(s);return 0;
+    // Memory helpers
+    template<typename T>
+    T Read(uintptr_t addr) {
+        if (!addr) return T{};
+        T val;
+        if (ReadProcessMemory(GetCurrentProcess(), (LPCVOID)addr, &val, sizeof(T), NULL))
+            return val;
+        return T{};
     }
-    template<typename T>T R(uintptr_t a){T v={};ReadProcessMemory(p,(LPCVOID)a,&v,sizeof(T),NULL);return v;}
-    void RB(uintptr_t a,void* b,size_t sz){ReadProcessMemory(p,(LPCVOID)a,b,sz,NULL);}
-    template<typename T>void W(uintptr_t a,T v){WriteProcessMemory(p,(LPVOID)a,&v,sizeof(T),NULL);}
-    void WB(uintptr_t a,void* b,size_t sz){DWORD old;VirtualProtect((LPVOID)a,sz,PAGE_EXECUTE_READWRITE,&old);WriteProcessMemory(p,(LPVOID)a,b,sz,NULL);VirtualProtect((LPVOID)a,sz,old,&old);}
 
-    uintptr_t FindSig(uint8_t* pat,char* mask){
-        if(!base)return 0;
-        auto dos=(IMAGE_DOS_HEADER*)base;
-        auto nt=(IMAGE_NT_HEADERS*)(base+dos->e_lfanew);
-        auto sec=IMAGE_FIRST_SECTION(nt);
-        for(WORD i=0;i<nt->FileHeader.NumberOfSections;i++){
-            char sn[9]={};memcpy(sn,sec[i].Name,8);
-            if(strcmp(sn,".text")==0){
-                uintptr_t st=base+sec[i].VirtualAddress;
-                size_t sz=sec[i].Misc.VirtualSize;
-                for(size_t j=0;j<sz-strlen(mask);j++){
-                    bool ok=true;
-                    for(size_t k=0;k<strlen(mask);k++)
-                        if(mask[k]=='x'&&((uint8_t*)(st+j))[k]!=pat[k]){ok=false;break;}
-                    if(ok)return st+j;
+    void ReadBuffer(uintptr_t addr, void* buf, size_t sz) {
+        if (addr)
+            ReadProcessMemory(GetCurrentProcess(), (LPCVOID)addr, buf, sz, NULL);
+    }
+
+    template<typename T>
+    void Write(uintptr_t addr, T val) {
+        if (addr)
+            WriteProcessMemory(GetCurrentProcess(), (LPVOID)addr, &val, sizeof(T), NULL);
+    }
+
+    void WriteBytes(uintptr_t addr, const uint8_t* data, size_t len) {
+        if (!addr) return;
+        DWORD old;
+        VirtualProtect((void*)addr, len, PAGE_EXECUTE_READWRITE, &old);
+        memcpy((void*)addr, data, len);
+        VirtualProtect((void*)addr, len, old, &old);
+    }
+
+    // FIXED ResolveRelative
+    uintptr_t ResolveRelative(uintptr_t addr, int offset = 3, int inst_len = 7) {
+        int32_t disp = *(int32_t*)(addr + offset);
+        return addr + inst_len + (int64_t)disp;
+    }
+
+    // Pattern scan
+    uintptr_t FindPattern(const char* pattern) {
+        static auto patternToBytes = [](const char* pat) -> std::vector<int> {
+            std::vector<int> bytes;
+            auto start = const_cast<char*>(pat);
+            auto end = start + strlen(pat);
+            for (auto c = start; c < end; ++c) {
+                if (*c == '?') { ++c; if (*c == '?') ++c; bytes.push_back(-1); }
+                else bytes.push_back((int)strtoul(c, &c, 16));
+            }
+            return bytes;
+        };
+
+        auto bytes = patternToBytes(pattern);
+        auto sz = bytes.size();
+        auto data = bytes.data();
+
+        for (uintptr_t i = 0; i < 0x20000000; i++) {  // scan 512MB
+            bool found = true;
+            for (size_t j = 0; j < sz; j++) {
+                if (data[j] != -1 && *(uint8_t*)(base + i + j) != (uint8_t)data[j]) {
+                    found = false;
+                    break;
                 }
             }
+            if (found) return base + i;
         }
         return 0;
     }
-    uintptr_t RIP(uintptr_t a,int o=3,int l=7){return a?a+l+*(int32_t*)(a+o):0;}
-    uintptr_t RP(uintptr_t a){return R<uintptr_t>(a);}
 
-    bool ScanAll(){
-        base=GetMod(L"aces.exe");if(!base)base=GetMod(L"launcher.exe");
-        if(!base){printf("[!] Game module not found\n");return false;}
-        printf("[+] Base: 0x%llX\n",base);
+    bool ScanAll() {
+        base = (uintptr_t)GetModuleHandleA("aces.exe");
+        if (!base) base = (uintptr_t)GetModuleHandleA(NULL);
+        printf("[+] Base: 0x%llX\n", (uint64_t)base);
 
-        uint8_t p1[]={0x48,0x8D,0x0D,0,0,0,0,0xE8};
-        uint8_t p2[]={0x48,0x8B,0x0D,0,0,0,0,0x48,0x85,0xC9,0x74};
-        uint8_t p3[]={0x48,0x8B,0x3D,0,0,0,0,0x48,0x85,0xFF,0x74};
-        uint8_t p4[]={0x0F,0x11,0x05,0,0,0,0,0x0F,0x11,0x0D};
-        uint8_t pCol[]={0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0xD9};
-        uintptr_t a;
-        a=FindSig(p1,"xxx????x");if(a){addr_cGame=RIP(a);printf("[+] cGame: 0x%llX\n",addr_cGame);printf("[DEBUG SCAN] cGame pattern at %llX, resolved to %llX, offset from base: %llX, value: %llX\n", (uint64_t)a, (uint64_t)addr_cGame, (uint64_t)(addr_cGame-base), (uint64_t)(*(uintptr_t*)addr_cGame));}
-        a=FindSig(p2,"xxx????xxxx");if(a){addr_cLocalPlayer=RIP(a);printf("[+] cLocalPlayer: 0x%llX\n",addr_cLocalPlayer);printf("[DEBUG SCAN] cLocalPlayer pattern at %llX, resolved to %llX, offset from base: %llX, value: %llX\n", (uint64_t)a, (uint64_t)addr_cLocalPlayer, (uint64_t)(addr_cLocalPlayer-base), (uint64_t)(*(uintptr_t*)addr_cLocalPlayer));}
-        a=FindSig(p3,"xxx????xxxx");if(a){addr_cPlayerList=RIP(a);printf("[+] cPlayerList: 0x%llX\n",addr_cPlayerList);printf("[DEBUG SCAN] cPlayerList pattern at %llX, resolved to %llX, offset from base: %llX, value: %llX\n", (uint64_t)a, (uint64_t)addr_cPlayerList, (uint64_t)(addr_cPlayerList-base), (uint64_t)(*(uintptr_t*)addr_cPlayerList));}
-        a=FindSig(p4,"xxx????xxx");if(a){addr_ViewMatrix=RIP(a);printf("[+] ViewMatrix: 0x%llX\n",addr_ViewMatrix);}
-        a=FindSig(pCol,"xxxxxxxxx");if(a){colAddr=a;colSize=5;printf("[+] Collision func: 0x%llX\n",colAddr);}
-        if(!colAddr){uint8_t pC2[]={0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
-            a=FindSig(pC2,"xxxxxxxxxxxxxxx");if(a){colAddr=a;colSize=5;printf("[+] Collision func2: 0x%llX\n",colAddr);}}
+        uintptr_t pat;
 
-        // Auto-detect entity fields
-        if(addr_cPlayerList){uintptr_t g=R<uintptr_t>(base+addr_cGame);if(g){uintptr_t l=R<uintptr_t>(g+addr_cPlayerList);if(l){uintptr_t e=R<uintptr_t>(l);if(e){
-            uint8_t b[0x400];RB(e,b,0x400);
-            for(int i=0;i<0x200;i+=4)if(*(float*)&b[i]==100.0f){off_hp=i;break;}
-            for(int i=0;i<0x200;i+=4){int v=*(int*)&b[i];if(v>=0&&v<=5){off_team=i;break;}}
-            for(int i=0;i<0x200;i+=4){
-                float f1=*(float*)&b[i],f2=*(float*)&b[i+4],f3=*(float*)&b[i+8];
-                if(fabs(f1)>50&&fabs(f2)>50&&fabs(f3)>0&&fabs(f1)<100000){off_pos=i;break;}
-            }
-            for(int i=0;i<0x200;i++)if(b[i]>='A'&&b[i]<='Z'&&b[i+1]>='a'){off_name=i;break;}
-        }}}}
-        printf("[*] pos:0x%X hp:0x%X team:0x%X name:0x%X\n",off_pos,off_hp,off_team,off_name);
-        return addr_cGame&&addr_cLocalPlayer&&addr_cPlayerList;
+        // cGame: 48 8B 05 ? ? ? ? F2 0F 10 4F 08
+        pat = FindPattern("48 8B 05 ? ? ? ? F2 0F 10 4F 08");
+        if (pat) {
+            addr_cGame = ResolveRelative(pat, 3, 7);
+            printf("[+] cGame: 0x%llX\n", (uint64_t)addr_cGame);
+        }
+
+        // cLocalPlayer: 48 8B 2D ? ? ? ? 48 85 ED 74 ? F6 85
+        pat = FindPattern("48 8B 2D ? ? ? ? 48 85 ED 74 ? F6 85");
+        if (pat) {
+            addr_cLocalPlayer = ResolveRelative(pat, 3, 7);
+            printf("[+] cLocalPlayer: 0x%llX\n", (uint64_t)addr_cLocalPlayer);
+        }
+
+        // cPlayerList: try multiple patterns
+        pat = FindPattern("48 8B 0D ? ? ? ? 89 C0 48 8B 1C C1 48 85 DB");
+        if (!pat)
+            pat = FindPattern("48 8B 0D ? ? ? ? 48 8B 1C C1 48 85 DB");
+        if (pat) {
+            addr_cPlayerList = ResolveRelative(pat, 3, 7);
+            printf("[+] cPlayerList: 0x%llX\n", (uint64_t)addr_cPlayerList);
+        }
+
+        // ViewMatrix: 48 8D 0D ? ? ? ? FF 15 ? ? ? ? 0F 28 05
+        pat = FindPattern("48 8D 0D ? ? ? ? FF 15 ? ? ? ? 0F 28 05");
+        if (pat) {
+            addr_ViewMatrix = ResolveRelative(pat, 3, 7);
+            printf("[+] ViewMatrix: 0x%llX\n", (uint64_t)addr_ViewMatrix);
+        }
+
+        // Collision func
+        pat = FindPattern("40 53 48 83 EC 20 48 8B D9");
+        if (pat) {
+            colAddr = pat;
+            colSize = 5;
+            printf("[+] Collision func: 0x%llX\n", (uint64_t)colAddr);
+        }
+
+        printf("[*] pos:0x%llX hp:0x%llX team:0x%llX name:0x%llX\n",
+               (uint64_t)pos_off, (uint64_t)hp_off, (uint64_t)team_off, (uint64_t)name_off);
+
+        // Debug: print the actual values at the resolved addresses
+        uint64_t cGame_val = Read<uint64_t>(addr_cGame);
+        uint64_t cLP_val = Read<uint64_t>(addr_cLocalPlayer);
+        uint64_t cPL_val = Read<uint64_t>(addr_cPlayerList);
+        printf("[DEBUG] cGame value = 0x%llX\n", cGame_val);
+        printf("[DEBUG] cLocalPlayer value = 0x%llX\n", cLP_val);
+        printf("[DEBUG] cPlayerList value = 0x%llX\n", cPL_val);
+
+        return addr_cGame && addr_cLocalPlayer && addr_cPlayerList;
     }
 
-    Entity GetLP(){
+    Entity GetLP() {
         Entity lp;
-        
-        // Try direct dereference
-        uintptr_t g = R<uintptr_t>(addr_cGame);
-        printf("[DIAG LP] cGame addr=%llx, value=%llx\n", (uint64_t)addr_cGame, (uint64_t)g);
-        
-        if (!g) {
-            // Try reading the pointer directly from the pattern result
-            uintptr_t raw_ptr = *(uintptr_t*)(addr_cGame);
-            printf("[DIAG LP] raw read at cGame addr: %llx\n", (uint64_t)raw_ptr);
-            
-            // Also try: maybe the pattern actually points to the game object directly
-            printf("[DIAG LP] Trying addr_cGame as direct object...\n");
-            g = addr_cGame;
+        pGame = Read<uintptr_t>(addr_cGame);
+        if (!pGame) {
+            printf("[WARN] cGame pointer is NULL\n");
+            return lp;
         }
-        
-        uintptr_t lp_ptr = R<uintptr_t>(addr_cLocalPlayer);
-        printf("[DIAG LP] cLocalPlayer value=%llx\n", (uint64_t)lp_ptr);
-        
-        if (lp_ptr) {
-            lp.addr = lp_ptr;
-            lp.pos = R<Vector3>(lp_ptr + off_pos);
-            lp.head = R<Vector3>(lp_ptr + off_head);
-            lp.hp = R<float>(lp_ptr + off_hp);
-            lp.mhp = R<float>(lp_ptr + off_mhp);
-            lp.team = R<int>(lp_ptr + off_team);
-            RB(lp_ptr + off_name, lp.name, 64);
-            lp.alive = lp.hp > 0;
+
+        uintptr_t lp_addr = Read<uintptr_t>(addr_cLocalPlayer);
+        if (!lp_addr) {
+            printf("[WARN] cLocalPlayer pointer is NULL\n");
+            return lp;
         }
-        
+
+        lp.addr = lp_addr;
+        lp.pos = Read<Vector3>(lp_addr + pos_off);
+        lp.head = Read<Vector3>(lp_addr + head_off);
+        lp.hp = Read<float>(lp_addr + hp_off);
+        lp.mhp = Read<float>(lp_addr + mhp_off);
+        lp.team = Read<int>(lp_addr + team_off);
+        ReadBuffer(lp_addr + name_off, lp.name, 64);
+        lp.alive = (lp.hp > 0.0f && lp.hp < 99999.0f);
         return lp;
     }
 
-    std::vector<Entity> GetEnts(){
+    std::vector<Entity> GetEnts() {
         std::vector<Entity> ents;
-        
-        // Step 1: Read the cGame pointer
-        uintptr_t g = R<uintptr_t>(addr_cGame);
-        printf("[DIAG] cGame addr=%llx, value=%llx\n", (uint64_t)addr_cGame, (uint64_t)g);
-        
-        if (!g) {
-            // Try reading the pointer directly from the pattern result
-            // without ResolveRelative - use the address of the lea instruction itself
-            uintptr_t raw_ptr = *(uintptr_t*)(addr_cGame);
-            printf("[DIAG] raw read at cGame addr: %llx\n", (uint64_t)raw_ptr);
-            
-            // Also try: maybe the pattern actually points to the game object directly
-            // and doesn't need dereferencing
-            printf("[DIAG] Trying addr_cGame as direct object...\n");
-            g = addr_cGame;
+        pGame = Read<uintptr_t>(addr_cGame);
+        if (!pGame) return ents;
+
+        uintptr_t plist_addr = Read<uintptr_t>(addr_cPlayerList);
+        if (!plist_addr) {
+            printf("[WARN] cPlayerList pointer is NULL\n");
+            return ents;
         }
-        
-        // Step 2: Read cPlayerList from the game object
-        uintptr_t pl = R<uintptr_t>(g + 0xB8);  // common offset for player list
-        printf("[DIAG] playerList from game+0xB8=%llx\n", (uint64_t)pl);
-        
-        // Step 3: Try the cPlayerList address directly too
-        uintptr_t pl_direct = R<uintptr_t>(addr_cPlayerList);
-        printf("[DIAG] cPlayerList value (direct)=%llx\n", (uint64_t)pl_direct);
-        
-        // Try alternate: maybe cPlayerList IS the list, not a pointer to it
-        printf("[DIAG] addr_cPlayerList itself=%llx\n", (uint64_t)addr_cPlayerList);
-        
-        // If cPlayerList has a valid value, try reading entities from it
-        uintptr_t list_base = pl_direct ? pl_direct : pl;
-        if (list_base) {
-            int count = R<int>(list_base + 0x8);  // count at offset 8?
-            printf("[DIAG] list count = %d\n", count);
-            
-            for (int i = 0; i < min(count, 50); i++) {
-                uintptr_t ent_ptr = R<uintptr_t>(list_base + i * 0x8);
-                printf("[DIAG] ent[%d] ptr = %llx\n", i, (uint64_t)ent_ptr);
+
+        // The entity list structure at plist_addr:
+        // [0x00]: pointer to array of entity pointers
+        // [0x08]: count (int32)
+        uintptr_t ent_array = Read<uintptr_t>(plist_addr);
+        int count = Read<int>(plist_addr + 0x8);
+
+        if (!ent_array || count <= 0 || count > 100) {
+            // Try alternate: plist_addr itself is the entity array start
+            // with count at offset 0x8
+            ent_array = plist_addr;
+            count = Read<int>(plist_addr + 0x8);
+            if (!ent_array || count <= 0 || count > 100) {
+                return ents;
             }
+            // ent_array is actually the whole struct, entities at offset 0
+            ent_array = Read<uintptr_t>(plist_addr);
+            count = Read<int>(plist_addr + 0x8);
+            if (!ent_array || count <= 0 || count > 100)
+                return ents;
         }
-        
+
+        for (int i = 0; i < min(count, 64); i++) {
+            // Each entity slot holds a pointer to the entity
+            uintptr_t e_ptr = Read<uintptr_t>(ent_array + (uintptr_t)i * 0x8);
+            if (!e_ptr) continue;
+
+            Entity e;
+            e.addr = e_ptr;
+            e.pos = Read<Vector3>(e_ptr + pos_off);
+            e.head = Read<Vector3>(e_ptr + head_off);
+            e.hp = Read<float>(e_ptr + hp_off);
+            e.mhp = Read<float>(e_ptr + mhp_off);
+            e.team = Read<int>(e_ptr + team_off);
+            ReadBuffer(e_ptr + name_off, e.name, 64);
+            e.alive = (e.hp > 0.0f && e.hp < 99999.0f);
+            ents.push_back(e);
+        }
+
         return ents;
     }
 
-    XMMATRIX GetVM(){XMMATRIX m;RB(addr_ViewMatrix,&m,sizeof(m));return m;}
+    bool W2S(Vector3 world, Vector2& screen, int sw, int sh) {
+        if (!addr_ViewMatrix) return false;
+        float vm[16];
+        ReadBuffer(addr_ViewMatrix, vm, sizeof(vm));
 
-    bool W2S(Vector3 w,Vector2&s,int sw=1920,int sh=1080){
-        XMMATRIX vm=GetVM();XMVECTOR v=XMLoadFloat3((XMFLOAT3*)&w);
-        XMVECTOR t=XMVector3Transform(v,vm);float wv=XMVectorGetW(t);
-        if(wv<0.01f)return false;
-        s.x=(sw/2.0f)*(1+XMVectorGetX(t)/wv);s.y=(sh/2.0f)*(1-XMVectorGetY(t)/wv);
+        float w = vm[3] * world.x + vm[7] * world.y + vm[11] * world.z + vm[15];
+        if (w < 0.001f) return false;
+
+        float invW = 1.0f / w;
+        float x = (vm[0] * world.x + vm[4] * world.y + vm[8] * world.z + vm[12]) * invW;
+        float y = (vm[1] * world.x + vm[5] * world.y + vm[9] * world.z + vm[13]) * invW;
+
+        screen.x = (float)sw / 2.0f + x * (float)sw / 2.0f;
+        screen.y = (float)sh / 2.0f - y * (float)sh / 2.0f;
         return true;
     }
 
-    Vector2 CalcAng(Vector3 src,Vector3 dst){
-        Vector3 d=dst-src;float l=d.Len();if(l<0.01f)return{0,0};
-        return{-atan2f(d.y,d.x)*(180/XM_PI),asinf(d.z/l)*(180/XM_PI)};
+    Vector2 CalcAng(Vector3 src, Vector3 dst) {
+        Vector3 delta = dst - src;
+        float len = delta.Len();
+        if (len < 0.001f) return {0,0};
+        return {
+            -atan2f(delta.x, delta.z) * (180.0f / 3.14159265f),
+            asinf(delta.y / len) * (180.0f / 3.14159265f)
+        };
     }
 
-    void SetAng(Vector2 a){
-        uintptr_t g=R<uintptr_t>(base+addr_cGame);if(!g)return;uintptr_t lp=R<uintptr_t>(g+addr_cLocalPlayer);if(!lp)return;
-        W<float>(lp+off_ang,a.y);W<float>(lp+off_ang+4,a.x);
+    void SetAng(Vector2 ang) {
+        // Try to find the view angle address
+        if (!pGame) return;
+        // Common view angle offsets from cGame
+        uintptr_t viewAngAddr = pGame + 0x2C0;  // may need tuning
+        Write<float>(viewAngAddr, ang.y);      // pitch (y)
+        Write<float>(viewAngAddr + 0x4, ang.x); // yaw (x)
     }
 
     void EnableWallbang(){
         if(!colAddr){printf("[!] No collision func found\n");return;}
-        if(!colSaved){RB(colAddr,colOrig,colSize);colSaved=true;}
-        uint8_t nops[32];memset(nops,0x90,colSize);WB(colAddr,nops,colSize);
+        if(!colSaved){ReadBuffer(colAddr,colOrig,colSize);colSaved=true;}
+        uint8_t nops[32];memset(nops,0x90,colSize);WriteBytes(colAddr,nops,colSize);
         printf("[+] Wallbang ON\n");
     }
-    void DisableWallbang(){if(colAddr&&colSaved)WB(colAddr,colOrig,colSize);printf("[-] Wallbang OFF\n");}
+    void DisableWallbang(){if(colAddr&&colSaved)WriteBytes(colAddr,colOrig,colSize);printf("[-] Wallbang OFF\n");}
 };
 GameMemory gMem;
 
