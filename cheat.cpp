@@ -120,51 +120,28 @@ public:
         }
     }
 
-    // SAFE pattern scan — uses VirtualQuery to avoid unmapped memory
-    uintptr_t FindPattern(const char* pattern) {
-        // Parse pattern
-        std::vector<int> bytes;
-        auto start = const_cast<char*>(pattern);
-        auto end = start + strlen(pattern);
-        for (auto c = start; c < end; ++c) {
-            if (*c == '?') {
-                ++c; if (*c == '?') ++c;
-                bytes.push_back(-1);
-            } else {
-                bytes.push_back((int)strtoul(c, &c, 16));
-            }
-        }
-
-        size_t sz = bytes.size();
-        int* data = bytes.data();
-
-        // Use VirtualQuery to scan only mapped memory
-        uintptr_t maxAddr = base + 0x20000000;
-        uintptr_t current = base;
-
-        while (current < maxAddr) {
-            MEMORY_BASIC_INFORMATION mbi;
-            if (!VirtualQuery((void*)current, &mbi, sizeof(mbi)))
-                break;
-
-            if (mbi.State == MEM_COMMIT && 
-                (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
-                
-                uintptr_t regionStart = (uintptr_t)mbi.BaseAddress;
-                uintptr_t regionEnd = regionStart + mbi.RegionSize;
-                
-                for (uintptr_t i = regionStart; i < regionEnd - sz; ++i) {
-                    bool found = true;
-                    for (size_t j = 0; j < sz; ++j) {
-                        if (data[j] != -1 && *(uint8_t*)(i + j) != (uint8_t)data[j]) {
-                            found = false;
-                            break;
-                        }
+    // Pattern scan using the original method that was working
+    uintptr_t FindSig(uint8_t* pat, char* mask) {
+        if (!base) return 0;
+        __try {
+            auto dos = (IMAGE_DOS_HEADER*)base;
+            auto nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+            auto sec = IMAGE_FIRST_SECTION(nt);
+            for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+                char sn[9] = {}; memcpy(sn, sec[i].Name, 8);
+                if (strcmp(sn, ".text") == 0) {
+                    uintptr_t st = base + sec[i].VirtualAddress;
+                    size_t sz = sec[i].Misc.VirtualSize;
+                    for (size_t j = 0; j < sz - strlen(mask); j++) {
+                        bool ok = true;
+                        for (size_t k = 0; k < strlen(mask); k++)
+                            if (mask[k] == 'x' && ((uint8_t*)(st + j))[k] != pat[k]) { ok = false; break; }
+                        if (ok) return st + j;
                     }
-                    if (found) return i;
                 }
             }
-            current += mbi.RegionSize;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            return 0;
         }
         return 0;
     }
@@ -172,54 +149,56 @@ public:
     bool ScanAll() {
         base = (uintptr_t)GetModuleHandleA("aces.exe");
         if (!base) {
-            printf("[!] aces.exe not found, trying base module\n");
-            base = (uintptr_t)GetModuleHandleA(NULL);
+            printf("[!] aces.exe not found, trying launcher.exe\n");
+            base = (uintptr_t)GetModuleHandleA("launcher.exe");
         }
-        if (!base) { printf("[!] No module base found\n"); return false; }
+        if (!base) { printf("[!] No game module found\n"); return false; }
         printf("[+] Base: 0x%llX\n", (uint64_t)base);
 
-        // cGame: 48 8B 05 ? ? ? ? F2 0F 10 4F 08
-        uintptr_t pat = FindPattern("48 8B 05 ? ? ? ? F2 0F 10 4F 08");
-        if (pat) {
-            addr_cGame = ResolveRelative(pat, 3, 7);
-            printf("[+] cGame: pat=0x%llX resolved=0x%llX\n", (uint64_t)pat, (uint64_t)addr_cGame);
+        uint8_t p1[] = {0x48,0x8D,0x0D,0,0,0,0,0xE8};
+        uint8_t p2[] = {0x48,0x8B,0x0D,0,0,0,0,0x48,0x85,0xC9,0x74};
+        uint8_t p3[] = {0x48,0x8B,0x3D,0,0,0,0,0x48,0x85,0xFF,0x74};
+        uint8_t p4[] = {0x0F,0x11,0x05,0,0,0,0,0x0F,0x11,0x0D};
+        uint8_t pCol[] = {0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0xD9};
+        uintptr_t a;
+
+        a = FindSig(p1, "xxx????x");
+        if (a) {
+            addr_cGame = ResolveRelative(a, 3, 7);
+            printf("[+] cGame: 0x%llX\n", (uint64_t)addr_cGame);
         } else {
             printf("[!] cGame pattern not found\n");
         }
 
-        // cLocalPlayer: 48 8B 2D ? ? ? ? 48 85 ED 74 ? F6 85
-        pat = FindPattern("48 8B 2D ? ? ? ? 48 85 ED 74 ? F6 85");
-        if (pat) {
-            addr_cLocalPlayer = ResolveRelative(pat, 3, 7);
-            printf("[+] cLocalPlayer: pat=0x%llX resolved=0x%llX\n", (uint64_t)pat, (uint64_t)addr_cLocalPlayer);
+        a = FindSig(p2, "xxx????xxxx");
+        if (a) {
+            addr_cLocalPlayer = ResolveRelative(a, 3, 7);
+            printf("[+] cLocalPlayer: 0x%llX\n", (uint64_t)addr_cLocalPlayer);
         } else {
             printf("[!] cLocalPlayer pattern not found\n");
         }
 
-        // cPlayerList: 48 8B 0D ? ? ? ? 48 8B 1C C1 48 85 DB
-        pat = FindPattern("48 8B 0D ? ? ? ? 48 8B 1C C1 48 85 DB");
-        if (!pat) pat = FindPattern("48 8B 0D ? ? ? ? 89 C0 48 8B 1C C1 48 85 DB");
-        if (pat) {
-            addr_cPlayerList = ResolveRelative(pat, 3, 7);
-            printf("[+] cPlayerList: pat=0x%llX resolved=0x%llX\n", (uint64_t)pat, (uint64_t)addr_cPlayerList);
+        a = FindSig(p3, "xxx????xxxx");
+        if (a) {
+            addr_cPlayerList = ResolveRelative(a, 3, 7);
+            printf("[+] cPlayerList: 0x%llX\n", (uint64_t)addr_cPlayerList);
         } else {
             printf("[!] cPlayerList pattern not found\n");
         }
 
-        // ViewMatrix: 48 8D 0D ? ? ? ? FF 15 ? ? ? ? 0F 28 05
-        pat = FindPattern("48 8D 0D ? ? ? ? FF 15 ? ? ? ? 0F 28 05");
-        if (pat) {
-            addr_ViewMatrix = ResolveRelative(pat, 3, 7);
-            printf("[+] ViewMatrix: pat=0x%llX resolved=0x%llX\n", (uint64_t)pat, (uint64_t)addr_ViewMatrix);
+        a = FindSig(p4, "xxx????xxx");
+        if (a) {
+            addr_ViewMatrix = ResolveRelative(a, 3, 7);
+            printf("[+] ViewMatrix: 0x%llX\n", (uint64_t)addr_ViewMatrix);
         } else {
             printf("[!] ViewMatrix pattern not found\n");
         }
 
-        // Collision func
-        pat = FindPattern("40 53 48 83 EC 20 48 8B D9 48 8B 0D ? ? ? ? 48 85 C9");
-        if (pat) {
-            addr_Collision = pat;
-            printf("[+] Collision func: 0x%llX\n", (uint64_t)pat);
+        a = FindSig(pCol, "xxxxxxxxx");
+        if (a) {
+            colAddr = a;
+            colSize = 5;
+            printf("[+] Collision func: 0x%llX\n", (uint64_t)colAddr);
         }
 
         // Debug: show what's at each resolved address
@@ -230,7 +209,7 @@ public:
         printf("[DEBUG] cLocalPlayer => 0x%llX\n", v_cLP);
         printf("[DEBUG] cPlayerList => 0x%llX\n", v_cPL);
 
-        return true;
+        return addr_cGame && addr_cLocalPlayer && addr_cPlayerList;
     }
 
     Entity GetLP() {
