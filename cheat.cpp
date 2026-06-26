@@ -48,7 +48,7 @@ struct Config {
     bool trig=false; float trigFov=12.0f; int trigMin=15,trigMax=35;
     bool wb=false; float penMult=20.0f;
     bool menu=true;
-    bool enableHook=false; // Safe mode - disable D3D hook to test DLL loading
+    bool enableHook=true; // Enable with delayed hook
 }cfg;
 
 const char* aimKeys[] = {"Left Mouse", "Right Mouse", "Middle Mouse", "X1 Mouse", "X2 Mouse"};
@@ -496,6 +496,20 @@ DWORD WINAPI GameThread(HMODULE m){
 // ===================================================================
 // MAIN
 // ===================================================================
+DWORD WINAPI DelayedHookThread(HMODULE m){
+    printf("[*] Waiting 5 seconds for game to initialize DirectX...\n");
+    Sleep(5000);
+    
+    printf("[*] Attempting delayed D3D hook...\n");
+    D3D11Hook d;D3D11Hook::inst=&d;
+    if(d.HookD3D()){
+        printf("[+] D3D11 + ImGui ready (delayed hook)\n");
+    } else {
+        printf("[!] Delayed hook failed - running without overlay\n");
+    }
+    return 0;
+}
+
 DWORD WINAPI Main(HMODULE m){
     AllocConsole();FILE*f;freopen_s(&f,"CONOUT$","w",stdout);
     printf("=== WT Research Tool v3.0 (ImGui) ===\n");
@@ -504,8 +518,8 @@ DWORD WINAPI Main(HMODULE m){
     if(!gMem.ScanAll()) printf("[!] Some offsets not found\n");
 
     if(cfg.enableHook){
-        D3D11Hook d;D3D11Hook::inst=&d;
-        if(d.HookD3D()) printf("[+] D3D11 + ImGui ready\n"); else printf("[!] Hook failed\n");
+        // Delay D3D hook to avoid early crash
+        CreateThread(0,0,(LPTHREAD_START_ROUTINE)DelayedHookThread,m,0,0);
     } else {
         printf("[*] D3D hook disabled - running in safe mode\n");
     }
