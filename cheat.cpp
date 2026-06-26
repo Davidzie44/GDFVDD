@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <TlHelp32.h>
 #include <random>
+#include <conio.h>
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
@@ -48,7 +49,8 @@ struct Config {
     bool trig=false; float trigFov=12.0f; int trigMin=15,trigMax=35;
     bool wb=false; float penMult=20.0f;
     bool menu=true;
-    bool enableHook=false; // D3D hook crashes - use console-only mode
+    bool enableHook=true; // D3D hook crashes - use console-only mode
+    bool d3dHookFailed=false; // Set to true if D3D hook fails
 }cfg;
 
 const char* aimKeys[] = {"Left Mouse", "Right Mouse", "Middle Mouse", "X1 Mouse", "X2 Mouse"};
@@ -64,6 +66,7 @@ class Memory {
     uintptr_t RP(uintptr_t a){return R<uintptr_t>(a);}
 public:
     uintptr_t colAddr=0; // Made public for menu display
+    uintptr_t GetBase(){return base;}
     Memory():p(GetCurrentProcess()){}
     uintptr_t GetMod(const wchar_t* n){
         HANDLE s=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,GetCurrentProcessId());
@@ -201,6 +204,7 @@ class D3D11Hook {
     ID3D11Device*dev=nullptr;ID3D11DeviceContext*ctx=nullptr;
     IDXGISwapChain*sc=nullptr;ID3D11RenderTargetView*rtv=nullptr;
     bool init=false; int sw=1920,sh=1080;
+    HWND hGameWnd=nullptr;
     typedef HRESULT(__stdcall*P_t)(IDXGISwapChain*,UINT,UINT);P_t orig=nullptr;
 public:
     static D3D11Hook*inst;
@@ -352,7 +356,8 @@ public:
     }
 
     bool HookD3D(){
-        // Find game window first
+        // Simple approach: Use a window overlay instead of D3D hook
+        // This is more stable and doesn't crash the game
         HWND hGameWnd = NULL;
         for(int i=0; i<100; i++){
             hGameWnd = FindWindowW(L"SDL_app", NULL);
@@ -367,74 +372,161 @@ public:
             if(hGameWnd) break;
             Sleep(50);
         }
+        if(!hGameWnd){printf("[!] Game window not found\n");return false;}
         printf("[+] Game window: 0x%llX\n", (uintptr_t)hGameWnd);
+        this->hGameWnd = hGameWnd;
 
-        // Create temp BUTTON class window (always registered)
-        HWND hTemp = CreateWindowExA(0, "BUTTON", "", WS_POPUP, 0, 0, 1, 1, NULL, NULL, NULL, NULL);
+        // Get client area (not including borders)
+        RECT rect;
+        GetClientRect(hGameWnd, &rect);
+        int w = rect.right - rect.left;
+        int h = rect.bottom - rect.top;
+        sw = w; sh = h;
 
-        ID3D11Device* td = NULL;
-        IDXGISwapChain* tc = NULL;
+        // Map client area to screen coordinates
+        POINT pt = {0, 0};
+        ClientToScreen(hGameWnd, &pt);
 
-        // Try game window first, then temp, then desktop
-        HWND targets[] = { hGameWnd, hTemp, GetDesktopWindow() };
-        D3D_DRIVER_TYPE types[] = { D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
-                                     D3D_DRIVER_TYPE_REFERENCE, D3D_DRIVER_TYPE_SOFTWARE };
+        // Create overlay window - only over game client area
+        HWND hOverlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            L"STATIC", L"", WS_POPUP, pt.x, pt.y, w, h, NULL, NULL, NULL, NULL);
+        if(!hOverlay){printf("[!] Failed to create overlay window\n");return false;}
 
-        for(int ti=0; ti<3; ti++){
-            if(!targets[ti]) continue;
-            for(int di=0; di<4; di++){
-                DXGI_SWAP_CHAIN_DESC sd={};
-                sd.BufferCount=1;
-                sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
-                sd.BufferDesc.Width=1; sd.BufferDesc.Height=1;
-                sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
-                sd.OutputWindow=targets[ti];
-                sd.SampleDesc.Count=1;
-                sd.Windowed=TRUE;
+        ShowWindow(hOverlay, SW_SHOWNA);
 
-                td=NULL; tc=NULL;
-                HRESULT hr = D3D11CreateDeviceAndSwapChain(NULL, types[di], NULL, 0,
-                    NULL, 0, D3D11_SDK_VERSION, &sd, &tc, &td, NULL, NULL);
-                if(SUCCEEDED(hr) && td && tc){
-                    printf("[+] Device OK (hwnd:%p, driver:%d)\n", targets[ti], types[di]);
-                    goto HOOK_IT;
-                }
-            }
+        g_hWindow = hOverlay;
+        oWndProc = (WNDPROC)SetWindowLongPtrW(hOverlay, GWLP_WNDPROC, (LONG_PTR)WndProcHook);
+
+        // Initialize ImGui for the overlay window
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO(); io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+        ImGui_ImplWin32_Init(hOverlay);
+
+        // Create a simple D3D11 device for the overlay
+        DXGI_SWAP_CHAIN_DESC sd={};
+        sd.BufferCount=1;
+        sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.BufferDesc.Width=w; sd.BufferDesc.Height=h;
+        sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.OutputWindow=hOverlay;
+        sd.SampleDesc.Count=1;
+        sd.Windowed=TRUE;
+
+        D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0 };
+        D3D_FEATURE_LEVEL selectedLevel;
+        HRESULT hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+            featureLevels, 1, D3D11_SDK_VERSION, &sd, &sc, &dev, &selectedLevel, &ctx);
+        if(FAILED(hr)||!dev||!sc){
+            printf("[!] Failed to create D3D device for overlay\n");
+            return false;
         }
 
-        if(hTemp) DestroyWindow(hTemp);
-        printf("[!] Cannot create D3D11 device\n");
-        return false;
+        ID3D11Texture2D*bb=nullptr;sc->GetBuffer(0,__uuidof(ID3D11Texture2D),(void**)&bb);
+        dev->CreateRenderTargetView(bb,nullptr,&rtv);bb->Release();
 
-HOOK_IT:
-        if(hTemp) DestroyWindow(hTemp);
-        // Keep tc alive for vtable access
+        ImGui_ImplDX11_Init(dev, ctx);
+        ImGui::StyleColorsDark();
 
-        void** vt = *(void***)tc;
-        printf("[*] VTable at %p\n", vt);
-        for(int vi=0; vi<12; vi++) printf("  vt[%d] = %p\n", vi, vt[vi]);
+        init=true;
+        printf("[+] Overlay window created with D3D11\n");
 
-        orig = (P_t)vt[8];
-        DWORD old;
-        VirtualProtect(&vt[8], 8, PAGE_READWRITE, &old);
-        vt[8] = (void*)&D3D11Hook::Hook;
-        VirtualProtect(&vt[8], 8, old, &old);
-
-        printf("[+] VTable hooked: vt[8] = %p -> %p\n", orig, vt[8]);
-
-        td->Release();
-        tc->Release();
         return true;
+    }
+
+    static DWORD WINAPI RenderThread(LPVOID param){
+        D3D11Hook* hook = (D3D11Hook*)param;
+        printf("[*] Render thread started\n");
+        int frameCount = 0;
+        while(hook->init){
+            Sleep(16); // ~60 FPS
+            frameCount++;
+
+            // Update overlay position to follow game window
+            RECT rect;
+            GetClientRect(hook->hGameWnd, &rect);
+            POINT pt = {0, 0};
+            ClientToScreen(hook->hGameWnd, &pt);
+            SetWindowPos(g_hWindow, HWND_TOPMOST, pt.x, pt.y, rect.right-rect.left, rect.bottom-rect.top, SWP_NOACTIVATE | SWP_NOZORDER);
+
+            if(frameCount % 60 == 0){
+                printf("[*] Rendering frame %d, window pos: %d,%d size: %dx%d\n", frameCount, pt.x, pt.y, rect.right-rect.left, rect.bottom-rect.top);
+            }
+
+            // Clear background to black (transparent due to COLORKEY)
+            float clearColor[4] = {0, 0, 0, 0};
+            hook->ctx->ClearRenderTargetView(hook->rtv, clearColor);
+
+            // Render
+            ImGui_ImplDX11_NewFrame();
+            ImGui_ImplWin32_NewFrame();
+            ImGui::NewFrame();
+
+            hook->DoESP();
+            if(cfg.menu) hook->DrawMenu();
+
+            ImGui::EndFrame();
+            ImGui::Render();
+            hook->ctx->OMSetRenderTargets(1, &hook->rtv, NULL);
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+            HRESULT hr = hook->sc->Present(1, 0);
+            if(FAILED(hr) && frameCount % 60 == 0){
+                printf("[!] Present failed: 0x%X\n", hr);
+            }
+        }
+        printf("[*] Render thread stopped\n");
+        return 0;
     }
 };
 D3D11Hook* D3D11Hook::inst=nullptr;
 
 // ===================================================================
+// CONSOLE MENU (fallback when D3D hook fails)
+// ===================================================================
+void ConsoleMenu(){
+    printf("\n=== CONSOLE MENU ===\n");
+    printf("[1] Toggle ESP: %s\n", cfg.esp ? "ON" : "OFF");
+    printf("[2] Toggle Aimbot: %s\n", cfg.aim ? "ON" : "OFF");
+    printf("[3] Toggle Triggerbot: %s\n", cfg.trig ? "ON" : "OFF");
+    printf("[4] Toggle Wallbang: %s\n", cfg.wb ? "ON" : "OFF");
+    printf("[5] ESP Max Distance: %.0fm\n", cfg.espMaxDist);
+    printf("[6] Aimbot FOV: %.1f\n", cfg.aimFov);
+    printf("[7] Aimbot Smoothness: %.1f\n", cfg.aimSmooth);
+    printf("[0] Exit\n");
+    printf("Choice: ");
+}
+
+// ===================================================================
 // AIMBOT + TRIGGERBOT THREAD
 // ===================================================================
 DWORD WINAPI GameThread(HMODULE m){
+    bool consoleMode = false;
     while(true){
         Sleep(5);
+
+        if(GetAsyncKeyState(VK_F1)&1){
+            consoleMode = !consoleMode;
+            if(consoleMode){
+                printf("\n=== CONSOLE MENU ENABLED ===\n");
+                ConsoleMenu();
+            } else {
+                printf("Console menu disabled\n");
+            }
+        }
+
+        if(consoleMode && kbhit()){
+            int c = getch();
+            switch(c){
+                case '1': cfg.esp = !cfg.esp; printf("ESP: %s\n", cfg.esp?"ON":"OFF"); ConsoleMenu(); break;
+                case '2': cfg.aim = !cfg.aim; printf("Aimbot: %s\n", cfg.aim?"ON":"OFF"); ConsoleMenu(); break;
+                case '3': cfg.trig = !cfg.trig; printf("Triggerbot: %s\n", cfg.trig?"ON":"OFF"); ConsoleMenu(); break;
+                case '4': cfg.wb = !cfg.wb; if(cfg.wb)gMem.EnableWallbang(); else gMem.DisableWallbang(); printf("Wallbang: %s\n", cfg.wb?"ON":"OFF"); ConsoleMenu(); break;
+                case '5': cfg.espMaxDist += 500; if(cfg.espMaxDist>10000)cfg.espMaxDist=100; printf("Max Dist: %.0fm\n", cfg.espMaxDist); ConsoleMenu(); break;
+                case '6': cfg.aimFov += 2; if(cfg.aimFov>30)cfg.aimFov=2; printf("FOV: %.1f\n", cfg.aimFov); ConsoleMenu(); break;
+                case '7': cfg.aimSmooth += 1; if(cfg.aimSmooth>20)cfg.aimSmooth=1; printf("Smooth: %.1f\n", cfg.aimSmooth); ConsoleMenu(); break;
+                case '0': consoleMode=false; printf("Console menu disabled\n"); break;
+            }
+        }
 
         if(cfg.aim){
             int key = (cfg.aimKey>=0&&cfg.aimKey<5) ? aimKeyCodes[cfg.aimKey] : VK_RBUTTON;
@@ -500,12 +592,18 @@ DWORD WINAPI DelayedHookThread(HMODULE m){
     printf("[*] Waiting 5 seconds for game to initialize DirectX...\n");
     Sleep(5000);
     
-    printf("[*] Attempting delayed D3D hook...\n");
-    D3D11Hook d;D3D11Hook::inst=&d;
+    printf("[*] Creating overlay window...\n");
+    static D3D11Hook d;
+    D3D11Hook::inst=&d;
     if(d.HookD3D()){
-        printf("[+] D3D11 + ImGui ready (delayed hook)\n");
+        printf("[+] Overlay window created successfully\n");
+        printf("[*] Starting render thread...\n");
+        CreateThread(NULL, 0, D3D11Hook::RenderThread, &d, 0, NULL);
     } else {
-        printf("[!] Delayed hook failed - running without overlay\n");
+        printf("[!] Overlay creation failed - running without ESP\n");
+        cfg.d3dHookFailed = true;
+        printf("[*] Press F1 to toggle console menu\n");
+        ConsoleMenu();
     }
     return 0;
 }
