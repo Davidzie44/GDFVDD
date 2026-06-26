@@ -2,8 +2,6 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <DirectXMath.h>
-#include <dwrite.h>
-#include <D3Dcompiler.h>
 #include <vector>
 #include <string>
 #include <cstdint>
@@ -13,11 +11,12 @@
 #include <algorithm>
 #include <TlHelp32.h>
 #include <random>
+#include "imgui.h"
+#include "imgui_impl_dx11.h"
+#include "imgui_impl_win32.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "dwrite.lib")
-#pragma comment(lib, "D3Dcompiler.lib")
 
 using namespace DirectX;
 
@@ -26,75 +25,50 @@ using namespace DirectX;
 // ===================================================================
 struct Vector2 { float x,y;
     Vector2():x(0),y(0){} Vector2(float a,float b):x(a),y(b){}
-    Vector2 operator+(Vector2 o){return{x+o.x,y+o.y};}
-    Vector2 operator-(Vector2 o){return{x-o.x,y-o.y};}
-    float Dot(Vector2 o){return x*o.x+y*o.y;}
-    float Len(){return sqrtf(x*x+y*y);}
-    float Dist(Vector2 o){Vector2 d=*this-o;return d.Len();}
+    float Dist(Vector2 o){float dx=x-o.x,dy=y-o.y;return sqrtf(dx*dx+dy*dy);}
 };
 struct Vector3 { float x,y,z;
     Vector3():x(0),y(0),z(0){} Vector3(float a,float b,float c):x(a),y(b),z(c){}
-    Vector3 operator+(Vector3 o){return{x+o.x,y+o.y,z+o.z};}
     Vector3 operator-(Vector3 o){return{x-o.x,y-o.y,z-o.z};}
-    Vector3 operator*(float s){return{x*s,y*s,z*s};}
-    Vector3 operator/(float s){return{x/s,y/s,z/s};}
     float Len(){return sqrtf(x*x+y*y+z*z);}
-    Vector3 Norm(){float l=Len();return l>0?*this/l:Vector3(0,0,0);}
-};
-struct Color { float r,g,b,a;
-    Color():r(1),g(1),b(1),a(1){} Color(float R,float G,float B,float A):r(R),g(G),b(B),a(A){}
-    static Color Red(){return{1,0,0,1};} static Color Green(){return{0,1,0,1};}
-    static Color Blue(){return{0,0,1,1};} static Color White(){return{1,1,1,1};}
-    static Color Black(){return{0,0,0,1};} static Color Yellow(){return{1,1,0,1};}
-    static Color Cyan(){return{0,1,1,1};} static Color Orange(){return{1,0.5f,0,1};}
-    Color Alpha(float a){return{r,g,b,a};}
 };
 
-// ===================================================================
-// ENTITY & CONFIG
-// ===================================================================
 struct Entity {
-    uintptr_t addr=0;
-    Vector3 pos,head;
-    float hp=0,mhp=100;
-    int team=0;
-    char name[64]={};
-    bool alive=false;
-    float dist=0;
+    uintptr_t addr=0; Vector3 pos,head;
+    float hp=0,mhp=100; int team=0; char name[64]={};
+    bool alive=false; float dist=0;
     Vector2 sp,sh,boxTL,boxBR;
 };
 
 struct Config {
-    bool esp=true,espBox=true,espSnap=true,espHealth=true,espDist=true,espName=true;
-    bool espTeamCheck=true; float espMaxDist=5000.0f;
-    bool aim=true; float aimFov=6.0f,aimSmooth=4.0f; int aimKey=VK_RBUTTON;
+    bool esp=true,espBox=true,espSnap=true,espHealth=true,espTeamCheck=true,espName=true;
+    float espMaxDist=5000.0f;
+    bool aim=true; float aimFov=6.0f,aimSmooth=4.0f; int aimKey=1; // 0=LM 1=RM 2=MM
     bool trig=false; float trigFov=12.0f; int trigMin=15,trigMax=35;
-    bool wb=false,wbPenBoost=false; float penMult=20.0f;
-    bool menu=true; int mx=10,my=10;
+    bool wb=false; float penMult=20.0f;
+    bool menu=true;
 }cfg;
 
+const char* aimKeys[] = {"Left Mouse", "Right Mouse", "Middle Mouse", "X1 Mouse", "X2 Mouse"};
+int aimKeyCodes[] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
+
 // ===================================================================
-// MEMORY MANAGER
+// MEMORY - same pattern scanning as before
 // ===================================================================
 class Memory {
-    HANDLE p; uintptr_t base=0,gPtr=0,lpPtr=0,plPtr=0,vmAddr=0,colAddr=0;
-    uint32_t oPos=0x80,oHead=0x90,oHp=0xC0,oMhp=0xC4,oTeam=0xD0,oName=0x100,oAlive=0x1A0,oAng=0x1A0;
+    HANDLE p; uintptr_t base=0,gPtr=0,lpPtr=0,plPtr=0,vmAddr=0;
+    uint32_t oPos=0x80,oHead=0x90,oHp=0xC0,oMhp=0xC4,oTeam=0xD0,oName=0x100,oAng=0x1A0;
     uint8_t colOrig[32]; int colSize=0; bool colSaved=false;
-
     uintptr_t RP(uintptr_t a){return R<uintptr_t>(a);}
-
 public:
+    uintptr_t colAddr=0; // Made public for menu display
     Memory():p(GetCurrentProcess()){}
-
-    bool HasColAddr(){return colAddr!=0;}
-
     uintptr_t GetMod(const wchar_t* n){
         HANDLE s=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,GetCurrentProcessId());
         MODULEENTRY32W e={sizeof(MODULEENTRY32W)};
         if(Module32FirstW(s,&e)) do if(_wcsicmp(e.szModule,n)==0){CloseHandle(s);return(uintptr_t)e.modBaseAddr;}while(Module32NextW(s,&e));
         CloseHandle(s);return 0;
     }
-
     template<typename T>T R(uintptr_t a){T v={};ReadProcessMemory(p,(LPCVOID)a,&v,sizeof(T),NULL);return v;}
     void RB(uintptr_t a,void* b,size_t sz){ReadProcessMemory(p,(LPCVOID)a,b,sz,NULL);}
     template<typename T>void W(uintptr_t a,T v){WriteProcessMemory(p,(LPVOID)a,&v,sizeof(T),NULL);}
@@ -120,7 +94,6 @@ public:
         }
         return 0;
     }
-
     uintptr_t RIP(uintptr_t a,int o=3,int l=7){return a?a+l+*(int32_t*)(a+o):0;}
 
     bool ScanAll(){
@@ -132,39 +105,29 @@ public:
         uint8_t p2[]={0x48,0x8B,0x0D,0,0,0,0,0x48,0x85,0xC9,0x74};
         uint8_t p3[]={0x48,0x8B,0x3D,0,0,0,0,0x48,0x85,0xFF,0x74};
         uint8_t p4[]={0x0F,0x11,0x05,0,0,0,0,0x0F,0x11,0x0D};
-
+        uint8_t pCol[]={0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0xD9};
         uintptr_t a;
         a=FindSig(p1,"xxx????x");if(a){gPtr=RIP(a);printf("[+] cGame: 0x%llX\n",gPtr);}
         a=FindSig(p2,"xxx????xxxx");if(a){lpPtr=RIP(a);printf("[+] cLocalPlayer: 0x%llX\n",lpPtr);}
         a=FindSig(p3,"xxx????xxxx");if(a){plPtr=RIP(a);printf("[+] cPlayerList: 0x%llX\n",plPtr);}
         a=FindSig(p4,"xxx????xxx");if(a){vmAddr=RIP(a);printf("[+] ViewMatrix: 0x%llX\n",vmAddr);}
-
-        // Try wallbang signatures
-        uint8_t pCol1[]={0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0xD9};
-        a=FindSig(pCol1,"xxxxxxxxx");if(a){colAddr=a;colSize=5;printf("[+] Collision func: 0x%llX\n",colAddr);}
-        if(!colAddr){
-            uint8_t pCol2[]={0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
-            a=FindSig(pCol2,"xxxxxxxxxxxxxxx");if(a){colAddr=a;colSize=5;printf("[+] Collision func (alt): 0x%llX\n",colAddr);}
-        }
+        a=FindSig(pCol,"xxxxxxxxx");if(a){colAddr=a;colSize=5;printf("[+] Collision func: 0x%llX\n",colAddr);}
+        if(!colAddr){uint8_t pC2[]={0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
+            a=FindSig(pC2,"xxxxxxxxxxxxxxx");if(a){colAddr=a;colSize=5;printf("[+] Collision func2: 0x%llX\n",colAddr);}}
 
         // Auto-detect entity fields
-        if(plPtr){
-            uintptr_t g=RP(base+gPtr);if(g){
-            uintptr_t l=RP(g+plPtr);if(l){
-            uintptr_t e=RP(l);if(e){
-                printf("[*] Probing entity at 0x%llX\n",e);
-                uint8_t b[0x400];RB(e,b,0x400);
-                for(int i=0;i<0x200;i+=4)if(*(float*)&b[i]==100.0f){oHp=i;printf("[+] hpOff:0x%X\n",i);break;}
-                for(int i=0;i<0x200;i+=4){int v=*(int*)&b[i];if(v>=0&&v<=5){oTeam=i;printf("[+] teamOff:0x%X(val:%d)\n",i,v);break;}}
-                for(int i=0;i<0x200;i+=4){
-                    float f1=*(float*)&b[i],f2=*(float*)&b[i+4],f3=*(float*)&b[i+8];
-                    if(fabs(f1)>50&&fabs(f2)>50&&fabs(f3)>0&&fabs(f1)<100000){oPos=i;oHead=i;printf("[+] posOff:0x%X\n",i);break;}
-                }
-                for(int i=0;i<0x200;i++)if(b[i]>='A'&&b[i]<='Z'&&b[i+1]>='a'){oName=i;char t[32]={};memcpy(t,&b[i],31);printf("[+] nameOff:0x%X(%s)\n",i,t);break;}
-            }}}
-        }
-        printf("[*] Entity offsets - pos:0x%X hp:0x%X team:0x%X name:0x%X\n",oPos,oHp,oTeam,oName);
-        return gPtr!=0&&lpPtr!=0&&plPtr!=0&&vmAddr!=0;
+        if(plPtr){uintptr_t g=RP(base+gPtr);if(g){uintptr_t l=RP(g+plPtr);if(l){uintptr_t e=RP(l);if(e){
+            uint8_t b[0x400];RB(e,b,0x400);
+            for(int i=0;i<0x200;i+=4)if(*(float*)&b[i]==100.0f){oHp=i;break;}
+            for(int i=0;i<0x200;i+=4){int v=*(int*)&b[i];if(v>=0&&v<=5){oTeam=i;break;}}
+            for(int i=0;i<0x200;i+=4){
+                float f1=*(float*)&b[i],f2=*(float*)&b[i+4],f3=*(float*)&b[i+8];
+                if(fabs(f1)>50&&fabs(f2)>50&&fabs(f3)>0&&fabs(f1)<100000){oPos=i;break;}
+            }
+            for(int i=0;i<0x200;i++)if(b[i]>='A'&&b[i]<='Z'&&b[i+1]>='a'){oName=i;break;}
+        }}}}
+        printf("[*] pos:0x%X hp:0x%X team:0x%X name:0x%X\n",oPos,oHp,oTeam,oName);
+        return gPtr&&lpPtr&&plPtr&&vmAddr;
     }
 
     Entity GetLP(){
@@ -178,14 +141,12 @@ public:
 
     std::vector<Entity> GetEnts(){
         std::vector<Entity> v;uintptr_t g=RP(base+gPtr);if(!g)return v;
-        uintptr_t l=RP(g+plPtr);if(!l)return v;int c=R<int>(l+0x8);
-        if(c>64||c<0)c=50;
-        for(int i=0;i<c;i++){
-            uintptr_t a=RP(l+0x10+i*8);if(!a)continue;
+        uintptr_t l=RP(g+plPtr);if(!l)return v;
+        int c=R<int>(l+0x8);if(c>64||c<0)c=50;
+        for(int i=0;i<c;i++){uintptr_t a=RP(l+0x10+i*8);if(!a)continue;
             Entity e;e.addr=a;e.pos=R<Vector3>(a+oPos);e.head=R<Vector3>(a+oHead);
             e.hp=R<float>(a+oHp);e.mhp=R<float>(a+oMhp);e.team=R<int>(a+oTeam);
-            RB(a+oName,e.name,64);e.alive=e.hp>0.1f;v.push_back(e);
-        }
+            RB(a+oName,e.name,64);e.alive=e.hp>0.1f;v.push_back(e);}
         return v;
     }
 
@@ -195,7 +156,8 @@ public:
         XMMATRIX vm=GetVM();XMVECTOR v=XMLoadFloat3((XMFLOAT3*)&w);
         XMVECTOR t=XMVector3Transform(v,vm);float wv=XMVectorGetW(t);
         if(wv<0.01f)return false;
-        s.x=(sw/2.0f)*(1+XMVectorGetX(t)/wv);s.y=(sh/2.0f)*(1-XMVectorGetY(t)/wv);return true;
+        s.x=(sw/2.0f)*(1+XMVectorGetX(t)/wv);s.y=(sh/2.0f)*(1-XMVectorGetY(t)/wv);
+        return true;
     }
 
     Vector2 CalcAng(Vector3 src,Vector3 dst){
@@ -209,49 +171,40 @@ public:
     }
 
     void EnableWallbang(){
-        if(!colAddr){
-            uint8_t pCol1[]={0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0xD9};
-            uintptr_t a=FindSig(pCol1,"xxxxxxxxx");if(a){colAddr=a;colSize=5;}
-            if(!colAddr){
-                uint8_t pCol2[]={0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
-                a=FindSig(pCol2,"xxxxxxxxxxxxxxx");if(a){colAddr=a;colSize=5;}
-            }
-            if(!colAddr){printf("[!] Cannot find collision func for wallbang\n");return;}
-            printf("[+] Found collision func at 0x%llX\n",colAddr);
-        }
+        if(!colAddr){printf("[!] No collision func found\n");return;}
         if(!colSaved){RB(colAddr,colOrig,colSize);colSaved=true;}
-        uint8_t nops[32];memset(nops,0x90,colSize);
-        WB(colAddr,nops,colSize);
-        printf("[+] Wallbang ON (patched 0x%llX)\n",colAddr);
+        uint8_t nops[32];memset(nops,0x90,colSize);WB(colAddr,nops,colSize);
+        printf("[+] Wallbang ON\n");
     }
-
-    void DisableWallbang(){
-        if(!colAddr||!colSaved)return;
-        WB(colAddr,colOrig,colSize);
-        printf("[-] Wallbang OFF\n");
-    }
+    void DisableWallbang(){if(colAddr&&colSaved)WB(colAddr,colOrig,colSize);printf("[-] Wallbang OFF\n");}
 }gMem;
 
 // ===================================================================
-// D3D11 RENDERER
+// GLOBAL WINDOW PROC FOR IMGUI
 // ===================================================================
-class D3D11 {
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static WNDPROC oWndProc = NULL;
+HWND g_hWindow = NULL;
+
+LRESULT CALLBACK WndProcHook(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam){
+    if(cfg.menu && ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        return TRUE;
+    return CallWindowProc(oWndProc, hWnd, msg, wParam, lParam);
+}
+
+// ===================================================================
+// D3D11 PRESENT HOOK + IMGUI
+// ===================================================================
+class D3D11Hook {
     ID3D11Device*dev=nullptr;ID3D11DeviceContext*ctx=nullptr;
     IDXGISwapChain*sc=nullptr;ID3D11RenderTargetView*rtv=nullptr;
-    ID3D11BlendState*bl=nullptr;ID3D11VertexShader*vs=nullptr;
-    ID3D11PixelShader*ps=nullptr;ID3D11InputLayout*il=nullptr;
-    ID3D11Buffer*vb=nullptr;ID3D11Buffer*cb=nullptr;
-    int sw=1920,sh=1080;bool init=false;
+    bool init=false; int sw=1920,sh=1080;
     typedef HRESULT(__stdcall*P_t)(IDXGISwapChain*,UINT,UINT);P_t orig=nullptr;
-    struct Vert{float x,y,z,w;float r,g,b,a;};
-    struct Mat4x4{float m[4][4];};
-
-    const char*vsSrc="cbuffer CB{float4x4 p;};struct VSIn{float4 p:POSITION;float4 c:COLOR;};struct PSIn{float4 p:SV_POSITION;float4 c:COLOR;};PSIn main(VSIn i){PSIn o;o.p=mul(p,i.p);o.c=i.c;return o;}";
-    const char*psSrc="struct PSIn{float4 p:SV_POSITION;float4 c:COLOR;};float4 main(PSIn i):SV_TARGET{return i.c;}";
-
 public:
-    static D3D11*inst;
-    static HRESULT __stdcall Hook(IDXGISwapChain*c,UINT s,UINT f){return inst->OnPresent(c,s,f);}
+    static D3D11Hook*inst;
+    static HRESULT __stdcall Hook(IDXGISwapChain*c,UINT s,UINT f){
+        return inst->OnPresent(c,s,f);
+    }
 
     HRESULT OnPresent(IDXGISwapChain*c,UINT s,UINT f){
         if(!init){
@@ -260,86 +213,44 @@ public:
             dev->CreateRenderTargetView(bb,nullptr,&rtv);bb->Release();
             DXGI_SWAP_CHAIN_DESC d;sc->GetDesc(&d);sw=d.BufferDesc.Width;sh=d.BufferDesc.Height;
 
-            D3D11_BLEND_DESC bd={};
-            bd.RenderTarget[0].BlendEnable=TRUE;
-            bd.RenderTarget[0].SrcBlend=D3D11_BLEND_SRC_ALPHA;
-            bd.RenderTarget[0].DestBlend=D3D11_BLEND_INV_SRC_ALPHA;
-            bd.RenderTarget[0].BlendOp=D3D11_BLEND_OP_ADD;
-            bd.RenderTarget[0].SrcBlendAlpha=D3D11_BLEND_ONE;
-            bd.RenderTarget[0].DestBlendAlpha=D3D11_BLEND_ZERO;
-            bd.RenderTarget[0].BlendOpAlpha=D3D11_BLEND_OP_ADD;
-            bd.RenderTarget[0].RenderTargetWriteMask=D3D11_COLOR_WRITE_ENABLE_ALL;
-            dev->CreateBlendState(&bd,&bl);
+            // Get game window for ImGui
+            g_hWindow = d.OutputWindow;
+            oWndProc = (WNDPROC)SetWindowLongPtrW(g_hWindow, GWLP_WNDPROC, (LONG_PTR)WndProcHook);
 
-            ID3DBlob*eb=nullptr,*vbB=nullptr,*pbB=nullptr;
-            D3DCompile(vsSrc,strlen(vsSrc),nullptr,nullptr,nullptr,"main","vs_4_0",0,0,&vbB,&eb);
-            if(vbB){dev->CreateVertexShader(vbB->GetBufferPointer(),vbB->GetBufferSize(),nullptr,&vs);}
-            D3DCompile(psSrc,strlen(psSrc),nullptr,nullptr,nullptr,"main","ps_4_0",0,0,&pbB,&eb);
-            if(pbB){dev->CreatePixelShader(pbB->GetBufferPointer(),pbB->GetBufferSize(),nullptr,&ps);}
+            // Init ImGui
+            ImGui::CreateContext();
+            ImGuiIO& io = ImGui::GetIO(); io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+            ImGui_ImplWin32_Init(g_hWindow);
+            ImGui_ImplDX11_Init(dev, ctx);
+            ImGui::StyleColorsDark();
 
-            D3D11_INPUT_ELEMENT_DESC ied[]={
-                {"POSITION",0,DXGI_FORMAT_R32G32B32A32_FLOAT,0,0,D3D11_INPUT_PER_VERTEX_DATA,0},
-                {"COLOR",0,DXGI_FORMAT_R32G32B32A32_FLOAT,0,16,D3D11_INPUT_PER_VERTEX_DATA,0}
-            };
-            if(vbB){dev->CreateInputLayout(ied,2,vbB->GetBufferPointer(),vbB->GetBufferSize(),&il);vbB->Release();}
-            if(pbB)pbB->Release();
-
-            D3D11_BUFFER_DESC bbd={};bbd.ByteWidth=sizeof(Vert)*6;bbd.Usage=D3D11_USAGE_DYNAMIC;
-            bbd.BindFlags=D3D11_BIND_VERTEX_BUFFER;bbd.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE;
-            dev->CreateBuffer(&bbd,nullptr,&vb);
-
-            Mat4x4 ortho={};ortho.m[0][0]=2.0f/sw;ortho.m[1][1]=-2.0f/sh;ortho.m[2][2]=1;ortho.m[3][3]=1;
-            ortho.m[3][0]=-1;ortho.m[3][1]=1;
-            D3D11_BUFFER_DESC cbd={};cbd.ByteWidth=sizeof(Mat4x4);cbd.Usage=D3D11_USAGE_DYNAMIC;
-            cbd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;cbd.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE;
-            dev->CreateBuffer(&cbd,nullptr,&cb);
-            D3D11_MAPPED_SUBRESOURCE ms;ctx->Map(cb,0,D3D11_MAP_WRITE_DISCARD,0,&ms);
-            memcpy(ms.pData,&ortho,sizeof(ortho));ctx->Unmap(cb,0);
-
-            init=true;printf("[+] D3D11 init (%dx%d)\n",sw,sh);
+            init=true; printf("[+] ImGui initialized\n");
         }
 
-        float bf[4]={1,1,1,1};ctx->OMSetBlendState(bl,bf,0xFFFFFFFF);
-        ctx->OMSetRenderTargets(1,&rtv,nullptr);
-        UINT stride=sizeof(Vert),off=0;
-        ctx->IASetVertexBuffers(0,1,&vb,&stride,&off);
-        ctx->IASetInputLayout(il);
-        ctx->VSSetShader(vs,nullptr,0);ctx->VSSetConstantBuffers(0,1,&cb);
-        ctx->PSSetShader(ps,nullptr,0);
+        // Draw ImGui
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
 
-        DoAll();
+        // ====== OVERLAY DRAWING ======
+        DoESP();
+        if(cfg.menu) DrawMenu();
+
+        ImGui::EndFrame();
+        ImGui::Render();
+        ctx->OMSetRenderTargets(1, &rtv, NULL);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
         return orig(c,s,f);
     }
 
-    void DrawLine(float x1,float y1,float x2,float y2,Color c){
-        Vert v[2]={{x1,y1,0,1,c.r,c.g,c.b,c.a},{x2,y2,0,1,c.r,c.g,c.b,c.a}};
-        D3D11_MAPPED_SUBRESOURCE ms;
-        if(SUCCEEDED(ctx->Map(vb,0,D3D11_MAP_WRITE_DISCARD,0,&ms))){
-            memcpy(ms.pData,v,sizeof(v));ctx->Unmap(vb,0);
-            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
-            ctx->Draw(2,0);
-        }
-    }
-
-    void DrawRect(float x,float y,float w,float h,Color c){
-        DrawLine(x,y,x+w,y,c);DrawLine(x+w,y,x+w,y+h,c);
-        DrawLine(x+w,y+h,x,y+h,c);DrawLine(x,y+h,x,y,c);
-    }
-
-    void DrawFill(float x,float y,float w,float h,Color c){
-        Vert v[6]={{x,y,0,1,c.r,c.g,c.b,c.a},{x+w,y,0,1,c.r,c.g,c.b,c.a},{x,y+h,0,1,c.r,c.g,c.b,c.a},
-                   {x+w,y,0,1,c.r,c.g,c.b,c.a},{x+w,y+h,0,1,c.r,c.g,c.b,c.a},{x,y+h,0,1,c.r,c.g,c.b,c.a}};
-        D3D11_MAPPED_SUBRESOURCE ms;
-        if(SUCCEEDED(ctx->Map(vb,0,D3D11_MAP_WRITE_DISCARD,0,&ms))){
-            memcpy(ms.pData,v,sizeof(v));ctx->Unmap(vb,0);
-            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            ctx->Draw(6,0);
-        }
-    }
-
+    // ====== ESP (uses ImGui DrawList for text) ======
     void DoESP(){
+        if(!cfg.esp)return;
         auto lp=gMem.GetLP();if(!lp.addr)return;
         auto es=gMem.GetEnts();
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
         for(auto&e:es){
             if(e.addr==lp.addr||!e.alive)continue;
             if(cfg.espTeamCheck&&e.team==lp.team)continue;
@@ -351,91 +262,91 @@ public:
             float w=h*0.6f;if(w<6)w=6;if(h<6)h=6;
             float bx=e.sp.x-w/2,by=e.sh.y;
 
-            Color ec=(e.team==lp.team)?Color::Green():Color::Red();
-            float alpha=(e.dist>1000)?max(0.2f,1-e.dist/5000):1.0f;
-            ec=ec.Alpha(alpha);
+            ImU32 color = (e.team==lp.team) ? IM_COL32(0,255,0,180) : IM_COL32(255,0,0,180);
+            float alpha = (e.dist>1000) ? max(0.2f,1-e.dist/5000) : 1.0f;
+            ImU32 colFade = (e.team==lp.team) ? IM_COL32(0,255,0,(int)(255*alpha)) : IM_COL32(255,0,0,(int)(255*alpha));
 
-            if(cfg.espBox)DrawRect(bx,by,w,h,ec);
-            if(cfg.espSnap)DrawLine(sw/2,sh,e.sp.x,e.sp.y,Color::White().Alpha(0.3f));
+            if(cfg.espBox) dl->AddRect(ImVec2(bx,by), ImVec2(bx+w,by+h), colFade);
+            if(cfg.espSnap) dl->AddLine(ImVec2(sw/2.0f,sh), ImVec2(e.sp.x,e.sp.y), IM_COL32(255,255,255,60));
             if(cfg.espHealth){
                 float p=e.hp/e.mhp;if(p<0)p=0;
-                DrawFill(bx-6,by,3,h,Color::Black().Alpha(0.6f));
-                Color hc=(p>0.5f)?Color::Green():((p>0.25f)?Color::Yellow():Color::Red());
-                DrawFill(bx-6,by+h*(1-p),3,h*p,hc);
+                dl->AddRectFilled(ImVec2(bx-6,by), ImVec2(bx-3,by+h), IM_COL32(0,0,0,150));
+                ImU32 hc = (p>0.5f)?IM_COL32(0,255,0,255):((p>0.25f)?IM_COL32(255,255,0,255):IM_COL32(255,0,0,255));
+                dl->AddRectFilled(ImVec2(bx-6,by+h*(1-p)), ImVec2(bx-3,by+h), hc);
             }
+            if(cfg.espName) dl->AddText(ImVec2(bx,by-14), IM_COL32(255,255,255,200), e.name);
+
+            // Distance text
+            char dst[32]; sprintf_s(dst, "%.0fm", e.dist);
+            dl->AddText(ImVec2(bx+w+4,by+h-14), IM_COL32(255,255,255,150), dst);
         }
     }
 
-    void DoAim(){
-        if(!cfg.aim||!(GetAsyncKeyState(cfg.aimKey)&0x8000))return;
-        auto lp=gMem.GetLP();if(!lp.addr||!lp.alive)return;
-        auto es=gMem.GetEnts();Entity*t=nullptr;float bf=cfg.aimFov;
-        for(auto&e:es){
-            if(e.addr==lp.addr||!e.alive)continue;
-            if(cfg.espTeamCheck&&e.team==lp.team)continue;
-            Vector2 s;if(!gMem.W2S(e.pos,s,sw,sh))continue;
-            float d=Vector2(s.x-sw/2,s.y-sh/2).Len();
-            if(d<bf){bf=d;t=&e;}
-        }
-        if(t){
-            Vector2 a=gMem.CalcAng(lp.pos,t->pos);
-            static Vector2 cur={0,0};
-            cur.x+=(a.x-cur.x)/cfg.aimSmooth;
-            cur.y+=(a.y-cur.y)/cfg.aimSmooth;
-            gMem.SetAng(cur);
-        }
-    }
+    // ====== MENU ======
+    void DrawMenu(){
+        ImGui::SetNextWindowSize(ImVec2(350, 420), ImGuiCond_FirstUseEver);
+        ImGui::Begin("WT Research Tool", &cfg.menu, ImGuiWindowFlags_NoCollapse);
 
-    void DoTrig(){
-        if(!cfg.trig)return;
-        auto lp=gMem.GetLP();if(!lp.addr||!lp.alive)return;
-        auto es=gMem.GetEnts();
-        for(auto&e:es){
-            if(e.addr==lp.addr||!e.alive)continue;
-            if(cfg.espTeamCheck&&e.team==lp.team)continue;
-            Vector2 s;if(!gMem.W2S(e.pos,s,sw,sh))continue;
-            float d=Vector2(s.x-sw/2,s.y-sh/2).Len();
-            if(d<cfg.trigFov){
-                // Set aim on target and fire
-                Vector2 a=gMem.CalcAng(lp.pos,e.pos);
-                gMem.SetAng(a);
-                INPUT ip={};ip.type=INPUT_MOUSE;ip.mi.dwFlags=MOUSEEVENTF_LEFTDOWN;
-                SendInput(1,&ip,sizeof(INPUT));
-                Sleep(cfg.trigMin+rand()%(cfg.trigMax-cfg.trigMin+1));
-                ip.mi.dwFlags=MOUSEEVENTF_LEFTUP;
-                SendInput(1,&ip,sizeof(INPUT));
-                break;
+        if(ImGui::BeginTabBar("Tabs")){
+
+            // === ESP TAB ===
+            if(ImGui::BeginTabItem("ESP")){
+                ImGui::Checkbox("Enable ESP", &cfg.esp);
+                ImGui::Separator();
+                ImGui::Checkbox("Box ESP", &cfg.espBox);
+                ImGui::SameLine(); ImGui::Checkbox("Snaplines", &cfg.espSnap);
+                ImGui::Checkbox("Health Bar", &cfg.espHealth);
+                ImGui::SameLine(); ImGui::Checkbox("Names", &cfg.espName);
+                ImGui::Checkbox("Team Check", &cfg.espTeamCheck);
+                ImGui::SliderFloat("Max Distance", &cfg.espMaxDist, 100, 10000, "%.0fm");
+                ImGui::EndTabItem();
             }
+
+            // === AIMBOT TAB ===
+            if(ImGui::BeginTabItem("Aimbot")){
+                ImGui::Checkbox("Enable Aimbot", &cfg.aim);
+                ImGui::Separator();
+                ImGui::SliderFloat("FOV", &cfg.aimFov, 1.0f, 30.0f, "%.1f px");
+                ImGui::SliderFloat("Smoothness", &cfg.aimSmooth, 1.0f, 20.0f, "%.1f");
+                ImGui::Combo("Activation Key", &cfg.aimKey, aimKeys, IM_ARRAYSIZE(aimKeys));
+                ImGui::EndTabItem();
+            }
+
+            // === TRIGGERBOT TAB ===
+            if(ImGui::BeginTabItem("Triggerbot")){
+                ImGui::Checkbox("Enable Triggerbot", &cfg.trig);
+                ImGui::Separator();
+                ImGui::SliderFloat("FOV", &cfg.trigFov, 1.0f, 50.0f, "%.1f px");
+                ImGui::SliderInt("Delay Min", &cfg.trigMin, 0, 200, "%d ms");
+                ImGui::SliderInt("Delay Max", &cfg.trigMax, 0, 200, "%d ms");
+                ImGui::EndTabItem();
+            }
+
+            // === WALLBANG TAB ===
+            if(ImGui::BeginTabItem("Wallbang")){
+                bool wbState = cfg.wb;
+                if(ImGui::Checkbox("Shoot Through Everything", &wbState)){
+                    cfg.wb=wbState;
+                    if(cfg.wb)gMem.EnableWallbang(); else gMem.DisableWallbang();
+                }
+                ImGui::Separator();
+                ImGui::SliderFloat("Pen Multiplier", &cfg.penMult, 1.0f, 50.0f, "%.1fx");
+                ImGui::TextWrapped("Patches the collision function so bullets pass through all geometry: walls, terrain, buildings, trees, ground.");
+                if(gMem.colAddr!=0){
+                    ImGui::Text("Collision func found: 0x%llX", gMem.colAddr);
+                } else {
+                    ImGui::TextColored(ImVec4(1,0,0,1), "Collision func not found. Wallbang may not work.");
+                }
+                ImGui::EndTabItem();
+            }
+
+            ImGui::EndTabBar();
         }
-    }
 
-    void DoMenu(){
-        if(!cfg.menu)return;
-        int x=cfg.mx,y=cfg.my,w=200,h=200;
-        DrawFill(x,y,w,h,Color::Black().Alpha(0.8f));
-        DrawRect(x,y,w,h,Color::Cyan());
+        ImGui::Separator();
+        ImGui::Text("INSERT - Toggle Menu | END - Unload");
 
-        int ly=y+15;
-        // ESP
-        DrawFill(x+5,ly-1,6,6,cfg.esp?Color::Green():Color::Red()); ly+=12;
-        DrawFill(x+10,ly-1,5,5,cfg.espBox?Color::Green():Color::Red().Alpha(0.5f));
-        DrawFill(x+30,ly-1,5,5,cfg.espSnap?Color::Green():Color::Red().Alpha(0.5f));
-        DrawFill(x+50,ly-1,5,5,cfg.espHealth?Color::Green():Color::Red().Alpha(0.5f));
-        DrawFill(x+70,ly-1,5,5,cfg.espTeamCheck?Color::Green():Color::Red().Alpha(0.5f));
-        ly+=15;
-        // Aim
-        DrawFill(x+5,ly-1,6,6,cfg.aim?Color::Green():Color::Red()); ly+=12;
-        // Trig
-        DrawFill(x+5,ly-1,6,6,cfg.trig?Color::Green():Color::Red()); ly+=12;
-        // Wallbang
-        DrawFill(x+5,ly-1,6,6,cfg.wb?Color::Green():Color::Red());
-    }
-
-    void DoAll(){
-        if(cfg.esp)DoESP();
-        DoAim();
-        DoTrig();
-        if(cfg.menu)DoMenu();
+        ImGui::End();
     }
 
     bool HookD3D(){
@@ -450,38 +361,72 @@ public:
                 return false;
         void**vt=*(void***)tc;orig=(P_t)vt[8];
         DWORD old;VirtualProtect(&vt[8],8,PAGE_READWRITE,&old);
-        vt[8]=Hook;VirtualProtect(&vt[8],8,old,&old);
+        vt[8]=(void*)&D3D11Hook::Hook;VirtualProtect(&vt[8],8,old,&old);
         td->Release();tc->Release();
         return true;
     }
 };
-D3D11* D3D11::inst=nullptr;
+D3D11Hook* D3D11Hook::inst=nullptr;
 
 // ===================================================================
-// HOTKEY THREAD
+// AIMBOT + TRIGGERBOT THREAD
 // ===================================================================
-DWORD WINAPI Hotkeys(HMODULE m){
+DWORD WINAPI GameThread(HMODULE m){
     while(true){
-        Sleep(50);
-        if(GetAsyncKeyState(VK_INSERT)&1)cfg.menu=!cfg.menu;
-        if(GetAsyncKeyState(VK_HOME)&1){cfg.aim=!cfg.aim;printf("[%s] Aimbot\n",cfg.aim?"ON":"OFF");}
-        if(GetAsyncKeyState(VK_DELETE)&1){cfg.trig=!cfg.trig;printf("[%s] Triggerbot\n",cfg.trig?"ON":"OFF");}
-        if(GetAsyncKeyState(VK_PRIOR)&1){
-            cfg.wb=!cfg.wb;
-            if(cfg.wb)gMem.EnableWallbang(); else gMem.DisableWallbang();
+        Sleep(5);
+
+        if(cfg.aim){
+            int key = (cfg.aimKey>=0&&cfg.aimKey<5) ? aimKeyCodes[cfg.aimKey] : VK_RBUTTON;
+            if(GetAsyncKeyState(key)&0x8000){
+                auto lp=gMem.GetLP();if(!lp.addr||!lp.alive)continue;
+                auto es=gMem.GetEnts();Entity*t=nullptr;float bf=cfg.aimFov;
+                int sw=1920,sh=1080;
+                for(auto&e:es){
+                    if(e.addr==lp.addr||!e.alive)continue;
+                    if(cfg.espTeamCheck&&e.team==lp.team)continue;
+                    Vector2 s;if(!gMem.W2S(e.pos,s,sw,sh))continue;
+                    float d=Vector2(s.x-sw/2,s.y-sh/2).Dist(Vector2(0,0));
+                    if(d<bf){bf=d;t=&e;}
+                }
+                if(t){
+                    Vector2 a=gMem.CalcAng(lp.pos,t->pos);
+                    static Vector2 cur={0,0};
+                    cur.x+=(a.x-cur.x)/cfg.aimSmooth;
+                    cur.y+=(a.y-cur.y)/cfg.aimSmooth;
+                    gMem.SetAng(cur);
+                }
+            }
         }
-        if(GetAsyncKeyState(VK_F1)&1)cfg.esp=!cfg.esp;
-        if(GetAsyncKeyState(VK_F2)&1)cfg.espBox=!cfg.espBox;
-        if(GetAsyncKeyState(VK_F3)&1)cfg.espSnap=!cfg.espSnap;
-        if(GetAsyncKeyState(VK_F4)&1)cfg.espHealth=!cfg.espHealth;
-        if(GetAsyncKeyState(VK_F5)&1)cfg.espTeamCheck=!cfg.espTeamCheck;
-        if(GetAsyncKeyState('1')&1){cfg.aimFov=max(1.0f,cfg.aimFov-1);printf("FOV: %.1f\n",cfg.aimFov);}
-        if(GetAsyncKeyState('2')&1){cfg.aimFov=min(30.0f,cfg.aimFov+1);printf("FOV: %.1f\n",cfg.aimFov);}
-        if(GetAsyncKeyState('3')&1){cfg.aimSmooth=max(1.0f,cfg.aimSmooth-1);printf("Smooth: %.1f\n",cfg.aimSmooth);}
-        if(GetAsyncKeyState('4')&1){cfg.aimSmooth=min(20.0f,cfg.aimSmooth+1);printf("Smooth: %.1f\n",cfg.aimSmooth);}
+
+        if(cfg.trig){
+            auto lp=gMem.GetLP();if(!lp.addr||!lp.alive)continue;
+            auto es=gMem.GetEnts();
+            int sw=1920,sh=1080;
+            for(auto&e:es){
+                if(e.addr==lp.addr||!e.alive)continue;
+                if(cfg.espTeamCheck&&e.team==lp.team)continue;
+                Vector2 s;if(!gMem.W2S(e.pos,s,sw,sh))continue;
+                float d=Vector2(s.x-sw/2,s.y-sh/2).Dist(Vector2(0,0));
+                if(d<cfg.trigFov){
+                    Vector2 a=gMem.CalcAng(lp.pos,e.pos);
+                    gMem.SetAng(a);
+                    INPUT ip={};ip.type=INPUT_MOUSE;ip.mi.dwFlags=MOUSEEVENTF_LEFTDOWN;
+                    SendInput(1,&ip,sizeof(INPUT));
+                    Sleep(cfg.trigMin+rand()%(max(1,cfg.trigMax-cfg.trigMin+1)));
+                    ip.mi.dwFlags=MOUSEEVENTF_LEFTUP;
+                    SendInput(1,&ip,sizeof(INPUT));
+                    break;
+                }
+            }
+        }
+
         if(GetAsyncKeyState(VK_END)&1){
-            printf("[*] Shutting down...\n");
             if(cfg.wb)gMem.DisableWallbang();
+            // Cleanup ImGui
+            ImGui_ImplDX11_Shutdown();
+            ImGui_ImplWin32_Shutdown();
+            if(oWndProc && g_hWindow) SetWindowLongPtrW(g_hWindow, GWLP_WNDPROC, (LONG_PTR)oWndProc);
+            ImGui::DestroyContext();
             FreeConsole();FreeLibraryAndExitThread(m,0);return 0;
         }
     }
@@ -492,23 +437,13 @@ DWORD WINAPI Hotkeys(HMODULE m){
 // ===================================================================
 DWORD WINAPI Main(HMODULE m){
     AllocConsole();FILE*f;freopen_s(&f,"CONOUT$","w",stdout);
-    printf("=== WT Research Tool v2.0 ===\n");
-    printf("[*] Scanning offsets...\n");
+    printf("=== WT Research Tool v3.0 (ImGui) ===\n");
+    if(!gMem.ScanAll()) printf("[!] Some offsets not found\n");
 
-    if(!gMem.ScanAll()){
-        printf("[!] Some offsets not found\n");
-    }
+    D3D11Hook d;D3D11Hook::inst=&d;
+    if(d.HookD3D()) printf("[+] D3D11 + ImGui ready\n"); else printf("[!] Hook failed\n");
 
-    D3D11 d;D3D11::inst=&d;
-    if(d.HookD3D())printf("[+] D3D11 hooked\n");
-    else printf("[!] D3D11 hook failed\n");
-
-    printf("\n=== HOTKEYS ===\n");
-    printf("INSERT  - Menu\nHOME    - Aimbot\nDELETE  - Triggerbot\n");
-    printf("PGUP    - Wallbang\nF1      - ESP\nF2-F5   - ESP features\n");
-    printf("1/2     - FOV -/+\n3/4     - Smooth -/+\nEND     - Unload\n");
-
-    CreateThread(0,0,(LPTHREAD_START_ROUTINE)Hotkeys,m,0,0);
+    CreateThread(0,0,(LPTHREAD_START_ROUTINE)GameThread,m,0,0);
     return 0;
 }
 
