@@ -48,7 +48,7 @@ struct Config {
     bool trig=false; float trigFov=12.0f; int trigMin=15,trigMax=35;
     bool wb=false; float penMult=20.0f;
     bool menu=true;
-    bool enableHook=true; // Enable with delayed hook
+    bool enableHook=false; // D3D hook crashes - use console-only mode
 }cfg;
 
 const char* aimKeys[] = {"Left Mouse", "Right Mouse", "Middle Mouse", "X1 Mouse", "X2 Mouse"};
