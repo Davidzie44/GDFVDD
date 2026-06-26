@@ -57,17 +57,36 @@ const char* aimKeys[] = {"Left Mouse", "Right Mouse", "Middle Mouse", "X1 Mouse"
 int aimKeyCodes[] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
 
 // ===================================================================
-// MEMORY - same pattern scanning as before
+// GAME MEMORY MANAGER
 // ===================================================================
-class Memory {
-    HANDLE p; uintptr_t base=0,gPtr=0,lpPtr=0,plPtr=0,vmAddr=0;
-    uint32_t oPos=0x80,oHead=0x90,oHp=0xC0,oMhp=0xC4,oTeam=0xD0,oName=0x100,oAng=0x1A0;
-    uint8_t colOrig[32]; int colSize=0; bool colSaved=false;
-    uintptr_t RP(uintptr_t a){return R<uintptr_t>(a);}
+class GameMemory {
 public:
+    HANDLE p;
+    uintptr_t base = 0;
+    uintptr_t addr_cGame = 0;
+    uintptr_t addr_cLocalPlayer = 0;
+    uintptr_t addr_cPlayerList = 0;
+    uintptr_t addr_ViewMatrix = 0;
+    uintptr_t addr_CollisionFunc = 0;
+
+    // Entity field offsets (scanned from game)
+    uint32_t off_pos = 0x80;
+    uint32_t off_hp = 0xC0;
+    uint32_t off_team = 0xD0;
+    uint32_t off_name = 0x100;
+    uint32_t off_alive = 0x2C8;
+    uint32_t off_mhp = 0xC4;
+    uint32_t off_head = 0x8C;
+    uint32_t off_playerList = 0x408;
+    uint32_t off_playerCount = 0x410;
+    uint32_t off_ang = 0x1A0;
+
+    float viewMatrix[16] = {};
+    uint8_t colOrig[32]; int colSize=0; bool colSaved=false;
+
     uintptr_t colAddr=0; // Made public for menu display
-    uintptr_t GetBase(){return base;}
-    Memory():p(GetCurrentProcess()){}
+
+    GameMemory():p(GetCurrentProcess()){}
     uintptr_t GetMod(const wchar_t* n){
         HANDLE s=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,GetCurrentProcessId());
         MODULEENTRY32W e={sizeof(MODULEENTRY32W)};
@@ -100,6 +119,7 @@ public:
         return 0;
     }
     uintptr_t RIP(uintptr_t a,int o=3,int l=7){return a?a+l+*(int32_t*)(a+o):0;}
+    uintptr_t RP(uintptr_t a){return R<uintptr_t>(a);}
 
     bool ScanAll(){
         base=GetMod(L"aces.exe");if(!base)base=GetMod(L"launcher.exe");
@@ -112,50 +132,69 @@ public:
         uint8_t p4[]={0x0F,0x11,0x05,0,0,0,0,0x0F,0x11,0x0D};
         uint8_t pCol[]={0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0xD9};
         uintptr_t a;
-        a=FindSig(p1,"xxx????x");if(a){gPtr=RIP(a);printf("[+] cGame: 0x%llX\n",gPtr);}
-        a=FindSig(p2,"xxx????xxxx");if(a){lpPtr=RIP(a);printf("[+] cLocalPlayer: 0x%llX\n",lpPtr);}
-        a=FindSig(p3,"xxx????xxxx");if(a){plPtr=RIP(a);printf("[+] cPlayerList: 0x%llX\n",plPtr);}
-        a=FindSig(p4,"xxx????xxx");if(a){vmAddr=RIP(a);printf("[+] ViewMatrix: 0x%llX\n",vmAddr);}
+        a=FindSig(p1,"xxx????x");if(a){addr_cGame=RIP(a);printf("[+] cGame: 0x%llX\n",addr_cGame);}
+        a=FindSig(p2,"xxx????xxxx");if(a){addr_cLocalPlayer=RIP(a);printf("[+] cLocalPlayer: 0x%llX\n",addr_cLocalPlayer);}
+        a=FindSig(p3,"xxx????xxxx");if(a){addr_cPlayerList=RIP(a);printf("[+] cPlayerList: 0x%llX\n",addr_cPlayerList);}
+        a=FindSig(p4,"xxx????xxx");if(a){addr_ViewMatrix=RIP(a);printf("[+] ViewMatrix: 0x%llX\n",addr_ViewMatrix);}
         a=FindSig(pCol,"xxxxxxxxx");if(a){colAddr=a;colSize=5;printf("[+] Collision func: 0x%llX\n",colAddr);}
         if(!colAddr){uint8_t pC2[]={0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
             a=FindSig(pC2,"xxxxxxxxxxxxxxx");if(a){colAddr=a;colSize=5;printf("[+] Collision func2: 0x%llX\n",colAddr);}}
 
         // Auto-detect entity fields
-        if(plPtr){uintptr_t g=RP(base+gPtr);if(g){uintptr_t l=RP(g+plPtr);if(l){uintptr_t e=RP(l);if(e){
+        if(addr_cPlayerList){uintptr_t g=R<uintptr_t>(base+addr_cGame);if(g){uintptr_t l=R<uintptr_t>(g+addr_cPlayerList);if(l){uintptr_t e=R<uintptr_t>(l);if(e){
             uint8_t b[0x400];RB(e,b,0x400);
-            for(int i=0;i<0x200;i+=4)if(*(float*)&b[i]==100.0f){oHp=i;break;}
-            for(int i=0;i<0x200;i+=4){int v=*(int*)&b[i];if(v>=0&&v<=5){oTeam=i;break;}}
+            for(int i=0;i<0x200;i+=4)if(*(float*)&b[i]==100.0f){off_hp=i;break;}
+            for(int i=0;i<0x200;i+=4){int v=*(int*)&b[i];if(v>=0&&v<=5){off_team=i;break;}}
             for(int i=0;i<0x200;i+=4){
                 float f1=*(float*)&b[i],f2=*(float*)&b[i+4],f3=*(float*)&b[i+8];
-                if(fabs(f1)>50&&fabs(f2)>50&&fabs(f3)>0&&fabs(f1)<100000){oPos=i;break;}
+                if(fabs(f1)>50&&fabs(f2)>50&&fabs(f3)>0&&fabs(f1)<100000){off_pos=i;break;}
             }
-            for(int i=0;i<0x200;i++)if(b[i]>='A'&&b[i]<='Z'&&b[i+1]>='a'){oName=i;break;}
+            for(int i=0;i<0x200;i++)if(b[i]>='A'&&b[i]<='Z'&&b[i+1]>='a'){off_name=i;break;}
         }}}}
-        printf("[*] pos:0x%X hp:0x%X team:0x%X name:0x%X\n",oPos,oHp,oTeam,oName);
-        return gPtr&&lpPtr&&plPtr&&vmAddr;
+        printf("[*] pos:0x%X hp:0x%X team:0x%X name:0x%X\n",off_pos,off_hp,off_team,off_name);
+        return addr_cGame&&addr_cLocalPlayer&&addr_cPlayerList;
     }
 
     Entity GetLP(){
-        Entity e;uintptr_t g=RP(base+gPtr);if(!g)return e;
-        e.addr=RP(g+lpPtr);if(!e.addr)return e;
-        e.pos=R<Vector3>(e.addr+oPos);e.head=R<Vector3>(e.addr+oHead);
-        e.hp=R<float>(e.addr+oHp);e.mhp=R<float>(e.addr+oMhp);
-        e.team=R<int>(e.addr+oTeam);RB(e.addr+oName,e.name,64);e.alive=e.hp>0.1f;
+        Entity e;
+        printf("[DEBUG] GetLP() - addr_cGame: 0x%llX, addr_cLocalPlayer: 0x%llX\n", addr_cGame, addr_cLocalPlayer);
+        uintptr_t g=R<uintptr_t>(base+addr_cGame);
+        printf("[DEBUG] GetLP() - g ptr: 0x%llX\n", g);
+        if(!g)return e;
+        e.addr=R<uintptr_t>(g+addr_cLocalPlayer);
+        printf("[DEBUG] GetLP() - local player addr: 0x%llX\n", e.addr);
+        if(!e.addr)return e;
+        e.pos=R<Vector3>(e.addr+off_pos);e.head=R<Vector3>(e.addr+off_head);
+        e.hp=R<float>(e.addr+off_hp);e.mhp=R<float>(e.addr+off_mhp);
+        e.team=R<int>(e.addr+off_team);RB(e.addr+off_name,e.name,64);e.alive=e.hp>0.1f;
+        printf("[DEBUG] GetLP() - hp:%.0f team:%d alive:%d\n", e.hp, e.team, e.alive);
         return e;
     }
 
     std::vector<Entity> GetEnts(){
-        std::vector<Entity> v;uintptr_t g=RP(base+gPtr);if(!g)return v;
-        uintptr_t l=RP(g+plPtr);if(!l)return v;
-        int c=R<int>(l+0x8);if(c>64||c<0)c=50;
-        for(int i=0;i<c;i++){uintptr_t a=RP(l+0x10+i*8);if(!a)continue;
-            Entity e;e.addr=a;e.pos=R<Vector3>(a+oPos);e.head=R<Vector3>(a+oHead);
-            e.hp=R<float>(a+oHp);e.mhp=R<float>(a+oMhp);e.team=R<int>(a+oTeam);
-            RB(a+oName,e.name,64);e.alive=e.hp>0.1f;v.push_back(e);}
+        std::vector<Entity> v;
+        printf("[DEBUG] GetEnts() - addr_cGame: 0x%llX, addr_cPlayerList: 0x%llX\n", addr_cGame, addr_cPlayerList);
+        uintptr_t g=R<uintptr_t>(base+addr_cGame);
+        printf("[DEBUG] GetEnts() - g ptr: 0x%llX\n", g);
+        if(!g)return v;
+        uintptr_t l=R<uintptr_t>(g+addr_cPlayerList);
+        printf("[DEBUG] GetEnts() - player list ptr: 0x%llX\n", l);
+        if(!l)return v;
+        int c=R<int>(l+0x8);
+        printf("[DEBUG] GetEnts() - player count: %d\n", c);
+        if(c>64||c<0)c=50;
+        for(int i=0;i<c;i++){uintptr_t a=R<uintptr_t>(l+0x10+i*8);
+            if(!a)continue;
+            Entity e;e.addr=a;e.pos=R<Vector3>(a+off_pos);e.head=R<Vector3>(a+off_head);
+            e.hp=R<float>(a+off_hp);e.mhp=R<float>(a+off_mhp);e.team=R<int>(a+off_team);
+            RB(a+off_name,e.name,64);e.alive=e.hp>0.1f;
+            printf("[DEBUG] Entity[%d] addr:0x%llX hp:%.0f team:%d alive:%d\n", i, a, e.hp, e.team, e.alive);
+            v.push_back(e);}
+        printf("[DEBUG] GetEnts() - total entities: %zu\n", v.size());
         return v;
     }
 
-    XMMATRIX GetVM(){XMMATRIX m;RB(vmAddr,&m,sizeof(m));return m;}
+    XMMATRIX GetVM(){XMMATRIX m;RB(addr_ViewMatrix,&m,sizeof(m));return m;}
 
     bool W2S(Vector3 w,Vector2&s,int sw=1920,int sh=1080){
         XMMATRIX vm=GetVM();XMVECTOR v=XMLoadFloat3((XMFLOAT3*)&w);
@@ -171,8 +210,8 @@ public:
     }
 
     void SetAng(Vector2 a){
-        uintptr_t g=RP(base+gPtr);if(!g)return;uintptr_t lp=RP(g+lpPtr);if(!lp)return;
-        W<float>(lp+oAng,a.y);W<float>(lp+oAng+4,a.x);
+        uintptr_t g=R<uintptr_t>(base+addr_cGame);if(!g)return;uintptr_t lp=R<uintptr_t>(g+addr_cLocalPlayer);if(!lp)return;
+        W<float>(lp+off_ang,a.y);W<float>(lp+off_ang+4,a.x);
     }
 
     void EnableWallbang(){
@@ -182,7 +221,8 @@ public:
         printf("[+] Wallbang ON\n");
     }
     void DisableWallbang(){if(colAddr&&colSaved)WB(colAddr,colOrig,colSize);printf("[-] Wallbang OFF\n");}
-}gMem;
+};
+GameMemory gMem;
 
 // ===================================================================
 // GLOBAL WINDOW PROC FOR IMGUI
