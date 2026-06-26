@@ -20,8 +20,28 @@ int main(){
     WriteProcessMemory(h,rem,path,4096,NULL);
     HANDLE t=CreateRemoteThread(h,NULL,0,(LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleA("kernel32.dll"),"LoadLibraryW"),rem,0,NULL);
 
-    if(t){printf("[+] Injected successfully\n");WaitForSingleObject(t,INFINITE);}
-    else printf("[!] Injection failed\n");
+    if(t){
+        printf("[+] Injected wt_tool.dll successfully\n");
+        WaitForSingleObject(t,INFINITE);
+
+        // Inject wt-dumper_[unknowncheats.me]_.dll
+        wchar_t dumperPath[MAX_PATH];
+        GetFullPathNameW(L"wt-dumper_[unknowncheats.me]_.dll",MAX_PATH,dumperPath,NULL);
+        void* remDumper=VirtualAllocEx(h,NULL,4096,MEM_COMMIT,PAGE_READWRITE);
+        WriteProcessMemory(h,remDumper,dumperPath,4096,NULL);
+        HANDLE tDumper=CreateRemoteThread(h,NULL,0,(LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleA("kernel32.dll"),"LoadLibraryW"),remDumper,0,NULL);
+
+        if(tDumper){
+            printf("[+] Injected wt-dumper_[unknowncheats.me]_.dll successfully\n");
+            WaitForSingleObject(tDumper,INFINITE);
+        } else {
+            printf("[!] Injection of wt-dumper_[unknowncheats.me]_.dll failed\n");
+        }
+        VirtualFreeEx(h,remDumper,0,MEM_RELEASE);
+
+    } else {
+        printf("[!] Injection of wt_tool.dll failed\n");
+    }
 
     VirtualFreeEx(h,rem,0,MEM_RELEASE);CloseHandle(h);
     system("pause");return 0;

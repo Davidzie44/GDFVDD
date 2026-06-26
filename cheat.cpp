@@ -68,13 +68,14 @@ public:
     uintptr_t addr_ViewMatrix = 0;
     uintptr_t addr_Collision = 0;
 
-    uintptr_t pos_off = 0x80;
-    uintptr_t hp_off = 0xC0;
-    uintptr_t team_off = 0xD0;
-    uintptr_t name_off = 0x100;
-    uintptr_t head_off = 0x8C;
-    uintptr_t mhp_off = 0xC4;
-    uintptr_t count_off = 0x8;  // PlayerList count offset
+    uintptr_t pos_off = 0xB8;  // Will auto-detect
+    uintptr_t hp_off = 0x208;  // Will auto-detect
+    uintptr_t team_off = 0x1000;  // From dumper
+    uintptr_t name_off = 0x3D0;
+    uintptr_t head_off = 0x148;
+    uintptr_t mhp_off = 0x20C;
+    uintptr_t count_off = 0x760;  // From dumper (UnitListCount1)
+    uintptr_t unitlist_off = 0x750;  // From dumper (UnitList1)
 
     uint8_t colOrig[32]; int colSize=0; bool colSaved=false;
     uintptr_t colAddr=0;
@@ -157,14 +158,14 @@ public:
         if (!base) { printf("[!] No game module found\n"); return false; }
         printf("[+] Base: 0x%llX\n", (uint64_t)base);
 
-        uint8_t p1[] = {0x48,0x8B,0x05,0,0,0,0,0xF2,0x0F,0x10,0x4F,0x08};
-        uint8_t p2[] = {0x48,0x8B,0x0D,0,0,0,0,0x48,0x85,0xC9,0x74};
-        uint8_t p3[] = {0x48,0x8B,0x3D,0,0,0,0,0x48,0x85,0xFF,0x74};
-        uint8_t p4[] = {0x0F,0x11,0x05,0,0,0,0,0x0F,0x11,0x0D};
-        uint8_t pCol[] = {0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0xD9};
+        uint8_t p1[] = {0x48,0x8B,0x05,0x00,0x00,0x00,0x00,0x48,0x8B,0x88,0xB0,0x02,0x00,0x00,0x48,0x85,0xC9,0x74,0x15,0xE8};
+        uint8_t p2[] = {0x48,0x8B,0x0D,0x00,0x00,0x00,0x00,0x48,0x85,0xC9,0x74,0x1A,0x8B,0x81,0xF0,0x03,0x00,0x00,0x85,0xC0};
+        uint8_t p3[] = {0x48,0x8B,0x15,0x00,0x00,0x00,0x00,0x48,0x8B,0x82,0x18,0x02,0x00,0x00,0x48,0x85,0xC0,0x0F,0x84};
+        uint8_t p4[] = {0x48,0x8D,0x0D,0x00,0x00,0x00,0x00,0x48,0x8B,0x01,0x48,0x89,0x45,0xE0,0x48,0x8D,0x55,0xD0,0xE8,0x00,0x00,0x00,0x00,0x48,0x8B,0x4D,0xE0};
+        uint8_t pCol[] = {0x40,0x53,0x48,0x83,0xEC,0x30,0x48,0x8B,0xD9,0xE8,0x00,0x00,0x00,0x00,0x48,0x85,0xC0,0x74,0x1F,0x48,0x8B,0x40,0x08,0xF3,0x0F,0x10,0x40,0x10,0x0F,0x2E,0x05};
         uintptr_t a;
 
-        a = FindSig(p1, "xxx????xxxxx");
+        a = FindSig(p1, "xxx????xxxxxxxxxxxxx");
         if (a) {
             addr_cGame = ResolveRelative(a, 3, 7);
             printf("[+] cGame: 0x%llX\n", (uint64_t)addr_cGame);
@@ -172,7 +173,7 @@ public:
             printf("[!] cGame pattern not found\n");
         }
 
-        a = FindSig(p2, "xxx????xxxx");
+        a = FindSig(p2, "xxx????xxxxxxxxxxxxx");
         if (a) {
             addr_cLocalPlayer = ResolveRelative(a, 3, 7);
             printf("[+] cLocalPlayer: 0x%llX\n", (uint64_t)addr_cLocalPlayer);
@@ -180,7 +181,7 @@ public:
             printf("[!] cLocalPlayer pattern not found\n");
         }
 
-        a = FindSig(p3, "xxx????xxxx");
+        a = FindSig(p3, "xxx????xxxxxxxxxxxx");
         if (a) {
             addr_cPlayerList = ResolveRelative(a, 3, 7);
             printf("[+] cPlayerList: 0x%llX\n", (uint64_t)addr_cPlayerList);
@@ -188,7 +189,7 @@ public:
             printf("[!] cPlayerList pattern not found\n");
         }
 
-        a = FindSig(p4, "xxx????xxx");
+        a = FindSig(p4, "xxx????xxxxxxxxxxxx????xxxx");
         if (a) {
             addr_ViewMatrix = ResolveRelative(a, 3, 7);
             printf("[+] ViewMatrix: 0x%llX\n", (uint64_t)addr_ViewMatrix);
@@ -196,106 +197,80 @@ public:
             printf("[!] ViewMatrix pattern not found\n");
         }
 
-        a = FindSig(pCol, "xxxxxxxxx");
+        a = FindSig(pCol, "xxxxxxxxxx????xxxxxxxxxxxxxxx");
         if (a) {
             colAddr = a;
             colSize = 5;
             printf("[+] Collision func: 0x%llX\n", (uint64_t)colAddr);
         }
 
-        // Debug: show what's at each resolved address
-        uint64_t v_cGame = Read<uint64_t>(addr_cGame);
-        uint64_t v_cLP = Read<uint64_t>(addr_cLocalPlayer);
-        uint64_t v_cPL = Read<uint64_t>(addr_cPlayerList);
-        printf("[DEBUG] cGame => 0x%llX\n", v_cGame);
-        printf("[DEBUG] cLocalPlayer => 0x%llX\n", v_cLP);
-        printf("[DEBUG] cPlayerList => 0x%llX\n", v_cPL);
+        // Use dumper offsets directly
+        addr_cGame = base + 0x706A868;
+        addr_cLocalPlayer = base + 0x70453A0;
+        addr_cPlayerList = 0;  // Not needed with new structure
+        
+        printf("[+] Using dumper offsets:\n");
+        printf("[+] cGame: 0x%llX (base + 0x706A868)\n", (uint64_t)addr_cGame);
+        printf("[+] cLocalPlayer: 0x%llX (base + 0x70453A0)\n", (uint64_t)addr_cLocalPlayer);
+        printf("[+] UnitList offset: 0x750\n");
+        printf("[+] UnitListCount offset: 0x760\n");
+        printf("[+] Team offset: 0x1000\n");
 
-        // Auto-detect entity field offsets
-        if (v_cGame && v_cPL) {
-            printf("[*] Auto-detecting entity offsets...\n");
-            uintptr_t plist = v_cPL;
+        // Auto-detect position and HP since dumper failed
+        uint64_t v_cGame = Read<uint64_t>(addr_cGame);
+        if (v_cGame) {
+            uintptr_t unitList = Read<uintptr_t>(v_cGame + unitlist_off);
+            int count = Read<int>(v_cGame + count_off);
             
-            // First, detect PlayerList structure to find count offset
-            uint8_t plistBuf[0x100];
-            ReadBuffer(plist, plistBuf, 0x100);
-            int countOff = 0;
-            for (int off = 0; off < 0x100; off += 4) {
-                int v = *(int*)&plistBuf[off];
-                if (v > 0 && v < 100) {  // Reasonable player count
-                    countOff = off;
-                    printf("[+] Found PlayerList count offset: 0x%X (value: %d)\n", off, v);
-                    break;
-                }
-            }
-            
-            uintptr_t entArray = Read<uintptr_t>(plist);
-            
-            // Try to find first entity
-            for (int i = 0; i < 64; i++) {
-                uintptr_t e = Read<uintptr_t>(entArray + i * 8);
-                if (e && e > 0x10000 && e < 0x7FFFFFFFFFFF) {
-                    uint8_t buf[0x400];
-                    ReadBuffer(e, buf, 0x400);
-                    
-                    // Find HP (float around 100)
-                    for (int off = 0; off < 0x200; off += 4) {
-                        float f = *(float*)&buf[off];
-                        if (f > 0 && f < 10000 && f == (int)f) {
-                            hp_off = off;
-                            printf("[+] Found hp offset: 0x%X (value: %.0f)\n", off, f);
-                            break;
+            if (unitList && count > 0) {
+                printf("[*] Auto-detecting pos/hp offsets...\n");
+                for (int i = 0; i < min(count, 10); i++) {
+                    uintptr_t e = Read<uintptr_t>(unitList + i * 8);
+                    if (e && e > 0x10000 && e < 0x7FFFFFFFFFFF) {
+                        uint8_t buf[0x400];
+                        ReadBuffer(e, buf, 0x400);
+                        
+                        // Find HP (float around 100)
+                        for (int off = 0; off < 0x200; off += 4) {
+                            float f = *(float*)&buf[off];
+                            if (f > 0 && f < 10000 && f == (int)f) {
+                                hp_off = off;
+                                printf("[+] Found hp offset: 0x%X (value: %.0f)\n", off, f);
+                                break;
+                            }
                         }
-                    }
-                    
-                    // Find team (small integer 0-5)
-                    for (int off = 0; off < 0x200; off += 4) {
-                        int v = *(int*)&buf[off];
-                        if (v >= 0 && v <= 5) {
-                            team_off = off;
-                            printf("[+] Found team offset: 0x%X (value: %d)\n", off, v);
-                            break;
+                        
+                        // Find position (3 floats with reasonable values)
+                        for (int off = 0; off < 0x200; off += 4) {
+                            float f1 = *(float*)&buf[off];
+                            float f2 = *(float*)&buf[off + 4];
+                            float f3 = *(float*)&buf[off + 8];
+                            if (fabs(f1) > 10 && fabs(f1) < 100000 &&
+                                fabs(f2) > 10 && fabs(f2) < 100000 &&
+                                fabs(f3) > 0 && fabs(f3) < 10000) {
+                                pos_off = off;
+                                printf("[+] Found pos offset: 0x%X (%.1f, %.1f, %.1f)\n", off, f1, f2, f3);
+                                break;
+                            }
                         }
+                        break;
                     }
-                    
-                    // Find position (3 floats with reasonable values)
-                    for (int off = 0; off < 0x200; off += 4) {
-                        float f1 = *(float*)&buf[off];
-                        float f2 = *(float*)&buf[off + 4];
-                        float f3 = *(float*)&buf[off + 8];
-                        if (fabs(f1) > 10 && fabs(f1) < 100000 &&
-                            fabs(f2) > 10 && fabs(f2) < 100000 &&
-                            fabs(f3) > 0 && fabs(f3) < 10000) {
-                            pos_off = off;
-                            printf("[+] Found pos offset: 0x%X (%.1f, %.1f, %.1f)\n", off, f1, f2, f3);
-                            break;
-                        }
-                    }
-                    
-                    break;
                 }
             }
         }
 
-        return addr_cGame && addr_cLocalPlayer && addr_cPlayerList;
+        return addr_cGame && addr_cLocalPlayer;
     }
 
     Entity GetLP() {
         Entity lp;
-        static int frame = 0;
-        frame++;
         
         uintptr_t g = Read<uintptr_t>(addr_cGame);
-        if (!g) { 
-            if (frame % 60 == 0) printf("[GAME] cGame is NULL\n");
-            return lp; 
-        }
+        if (!g) return lp;
 
         uintptr_t lp_addr = Read<uintptr_t>(addr_cLocalPlayer);
-        if (!lp_addr) { 
-            if (frame % 60 == 0) printf("[GAME] Local player is NULL\n");
-            return lp; 
-        }
+        // Stricter validation for the local player pointer
+        if (!lp_addr || IsBadReadPtr((void*)lp_addr, sizeof(Vector3))) return lp;
 
         lp.addr = lp_addr;
         lp.pos = Read<Vector3>(lp_addr + pos_off);
@@ -304,43 +279,31 @@ public:
         lp.mhp = Read<float>(lp_addr + mhp_off);
         lp.team = Read<int>(lp_addr + team_off);
         ReadBuffer(lp_addr + name_off, lp.name, 64);
-        lp.alive = (lp.hp > 0.0f && lp.hp < 50000.0f);
         
-        if (frame % 60 == 0) printf("[GAME] LP: hp=%.0f team=%d alive=%d\n", lp.hp, lp.team, lp.alive);
+        // Sane check for HP and health validity
+        lp.alive = (lp.hp > 0.0f && lp.hp <= lp.mhp && lp.mhp < 50000.0f);
+        
         return lp;
     }
 
     std::vector<Entity> GetEnts() {
         std::vector<Entity> ents;
-        static int frame = 0;
-        frame++;
         
         uintptr_t g = Read<uintptr_t>(addr_cGame);
-        if (!g) {
-            if (frame % 60 == 0) printf("[GAME] cGame is NULL in GetEnts\n");
+        if (!g) return ents;
+
+        // Use dumper structure: UnitList1 at CGame + 0x750, count at CGame + 0x760
+        uintptr_t unitList = Read<uintptr_t>(g + unitlist_off);
+        int count = Read<int>(g + count_off);
+
+        // Sanity check for count and array pointer
+        if (!unitList || IsBadReadPtr((void*)unitList, sizeof(uintptr_t) * 128) || count <= 0 || count > 128) {
             return ents;
         }
 
-        uintptr_t plist = Read<uintptr_t>(addr_cPlayerList);
-        if (!plist) {
-            if (frame % 60 == 0) printf("[GAME] PlayerList is NULL\n");
-            return ents;
-        }
-
-        // Try reading the entity list structure
-        // Usually: plist points to { uintptr_t* array; int count; ... }
-        uintptr_t entArray = Read<uintptr_t>(plist);
-        int count = Read<int>(plist + count_off);
-
-        if (frame % 60 == 0) printf("[GAME] PlayerList: array=0x%llX count=%d (off=0x%X)\n", (uint64_t)entArray, count, count_off);
-
-        if (!entArray || count <= 0 || count > 100) {
-            return ents;
-        }
-
-        for (int i = 0; i < min(count, 64); i++) {
-            uintptr_t e_ptr = Read<uintptr_t>(entArray + (uintptr_t)i * 8);
-            if (!e_ptr) continue;
+        for (int i = 0; i < count; i++) {
+            uintptr_t e_ptr = Read<uintptr_t>(unitList + (uintptr_t)i * 8);
+            if (!e_ptr || IsBadReadPtr((void*)e_ptr, 0x200)) continue;
 
             Entity e;
             e.addr = e_ptr;
@@ -350,11 +313,16 @@ public:
             e.mhp = Read<float>(e_ptr + mhp_off);
             e.team = Read<int>(e_ptr + team_off);
             ReadBuffer(e_ptr + name_off, e.name, 64);
-            e.alive = (e.hp > 0.0f && e.hp < 50000.0f);
-            ents.push_back(e);
+            
+            // Stricter check for entity data
+            e.alive = (e.hp > 0.0f && e.hp <= e.mhp && e.mhp < 50000.0f);
+            
+            // Only add valid-looking entities
+            if (e.alive) {
+                ents.push_back(e);
+            }
         }
         
-        if (frame % 60 == 0) printf("[GAME] Found %zu entities\n", ents.size());
         return ents;
     }
 
