@@ -2,6 +2,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <dwmapi.h>
+#include <TlHelp32.h>
 #include <thread>
 #include <atomic>
 #include <chrono>
@@ -40,6 +41,62 @@ std::atomic<bool> running(true);
 std::atomic<bool> menuOpen(false);
 std::mutex dataMutex;
 
+// CS2 window info from EnumWindows
+struct CS2WindowInfo {
+    HWND hwnd = NULL;
+    int width = 0;
+    int height = 0;
+    int x = 0;
+    int y = 0;
+    bool valid = false;
+};
+
+DWORD g_cs2ProcessId = 0;
+
+BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    DWORD processId = 0;
+    GetWindowThreadProcessId(hwnd, &processId);
+    if (processId != g_cs2ProcessId) return TRUE;
+
+    char className[256] = {};
+    GetClassNameA(hwnd, className, sizeof(className));
+    if (strcmp(className, "SDL_app") != 0) return TRUE;
+
+    RECT rect;
+    if (!GetClientRect(hwnd, &rect)) return TRUE;
+
+    CS2WindowInfo* info = (CS2WindowInfo*)lParam;
+    POINT topLeft = { rect.left, rect.top };
+    ClientToScreen(hwnd, &topLeft);
+
+    info->hwnd = hwnd;
+    info->x = topLeft.x;
+    info->y = topLeft.y;
+    info->width = rect.right - rect.left;
+    info->height = rect.bottom - rect.top;
+
+    if (info->width > 800 && info->height > 600 && info->x >= 0 && info->x < 5000) {
+        info->valid = true;
+    }
+
+    return TRUE;
+}
+
+CS2WindowInfo FindCS2Window() {
+    CS2WindowInfo info;
+    EnumWindows(EnumWindowsProc, (LPARAM)&info);
+    return info;
+}
+
+bool IsCS2Foreground(HWND cs2Window) {
+    HWND foreground = GetForegroundWindow();
+    if (!foreground) return false;
+    if (foreground == cs2Window) return true;
+    HWND parent = GetParent(foreground);
+    if (parent == cs2Window) return true;
+    return false;
+}
+
 // Settings
 bool espEnabled = true;
 bool espBoxes = true;
@@ -55,115 +112,14 @@ bool aimbotEnabled = false;
 float aimbotSmoothing = 2.0f;
 float aimbotFOV = 15.0f;
 float aimbotRCS = 2.0f;
-int aimbotBone = 0; // 0=Head, 1=Neck, 2=Chest, 3=Pelvis, 4=Feet
+int aimbotBone = 0;
 bool aimbotVisibilityCheck = false;
 bool aimbotTargetLock = false;
 
 int aimKey = VK_XBUTTON1;
 
-// Find CS2 window
-HWND FindCS2Window() {
-    HWND hwnd = nullptr;
-    
-    while (!hwnd && running) {
-        // Try known CS2 window classes
-        hwnd = FindWindowW(L"SDL_app", nullptr);
-        if (!hwnd) hwnd = FindWindowW(L"Valve001", nullptr);
-        
-        // Try enumerating all windows to find one with the right title
-        if (!hwnd) {
-            struct FindData { HWND result; } data = {nullptr};
-            EnumWindows([](HWND h, LPARAM lParam) -> BOOL {
-                wchar_t title[256] = {};
-                GetWindowTextW(h, title, 256);
-                if (wcsstr(title, L"Counter-Strike 2") || wcsstr(title, L"CS2")) {
-                    wchar_t className[256] = {};
-                    GetClassNameW(h, className, 256);
-                    // Skip tiny/hidden windows
-                    RECT r;
-                    if (GetWindowRect(h, &r) && (r.right - r.left) > 200 && (r.bottom - r.top) > 200) {
-                        reinterpret_cast<FindData*>(lParam)->result = h;
-                        return FALSE;
-                    }
-                }
-                return TRUE;
-            }, reinterpret_cast<LPARAM>(&data));
-            hwnd = data.result;
-        }
-        
-        if (!hwnd) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        } else {
-            // Verify the window is usable
-            RECT r;
-            GetWindowRect(hwnd, &r);
-            wchar_t className[256] = {};
-            GetClassNameW(hwnd, className, 256);
-            wchar_t title[256] = {};
-            GetWindowTextW(hwnd, title, 256);
-            
-            char logMsg[512];
-            sprintf_s(logMsg, "Found window: class='%S' title='%S' rect=(%d,%d,%d,%d) size=%dx%d",
-                     className, title, r.left, r.top, r.right, r.bottom,
-                     r.right - r.left, r.bottom - r.top);
-            Log(logMsg);
-            
-            // If window is too small or off-screen, try again
-            if ((r.right - r.left) < 200 || (r.bottom - r.top) < 200) {
-                hwnd = nullptr;
-                Log("Window too small, retrying...");
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
-        }
-    }
-    
-    return hwnd;
-}
-
-// Check if CS2 is the foreground window
-bool IsCS2Foreground(HWND cs2Window) {
-    HWND foreground = GetForegroundWindow();
-    if (!foreground) return false;
-    if (foreground == cs2Window) return true;
-    HWND parent = GetParent(foreground);
-    if (parent == cs2Window) return true;
-    return false;
-}
-
-// Get CS2 window rect - handles borderless fullscreen properly
-RECT GetCS2ClientRect(HWND targetWindow) {
-    RECT rect;
-    GetWindowRect(targetWindow, &rect);
-    return rect;
-}
-
 // DirectX 11 Overlay Window
-HWND CreateOverlayWindow(HWND targetWindow) {
-    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
-    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-    
-    RECT rect = {};
-    GetWindowRect(targetWindow, &rect);
-    
-    int overlayX = rect.left;
-    int overlayY = rect.top;
-    int overlayWidth = rect.right - rect.left;
-    int overlayHeight = rect.bottom - rect.top;
-    
-    // Detect fullscreen or garbage coordinates from DXGI fullscreen windows
-    bool isOffScreen = (overlayX < -100 || overlayY < -100 || 
-                       overlayX > screenWidth + 100 || overlayY > screenHeight + 100);
-    bool coversScreen = (overlayWidth >= screenWidth - 50 && overlayHeight >= screenHeight - 50);
-    bool tooSmall = (overlayWidth < 200 || overlayHeight < 200);
-    
-    if (isOffScreen || coversScreen || tooSmall) {
-        overlayX = 0;
-        overlayY = 0;
-        overlayWidth = screenWidth;
-        overlayHeight = screenHeight;
-        Log("Using full screen overlay (detected fullscreen/garbage coords)");
-    }
-    
+HWND CreateOverlayWindow(int x, int y, int w, int h) {
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(WNDCLASSEXW);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -172,102 +128,93 @@ HWND CreateOverlayWindow(HWND targetWindow) {
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = NULL;
     wc.lpszClassName = L"CS2Overlay";
-    
+
     RegisterClassExW(&wc);
-    
+
     HWND hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
         L"CS2Overlay", L"CS2 Tool", WS_POPUP,
-        overlayX, overlayY, overlayWidth, overlayHeight,
+        x, y, w, h,
         nullptr, nullptr, GetModuleHandle(nullptr), nullptr
     );
-    
+
     SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
-    
     SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_TRANSPARENT | WS_EX_LAYERED);
-    
+
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
-    
-    char overlayMsg[256];
-    sprintf_s(overlayMsg, "Overlay window created: %p at (%d, %d) size %dx%d", hwnd, overlayX, overlayY, overlayWidth, overlayHeight);
-    Log(overlayMsg);
+
+    char msg[256];
+    sprintf_s(msg, "Overlay created at (%d, %d) size %dx%d", x, y, w, h);
+    Log(msg);
     return hwnd;
 }
 
 // Render thread
-void RenderThread(HWND overlayWindow, HWND targetWindow, 
+void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
                   ProcessMemory* process, EntityManager* entityManager,
                   WorldToScreen* worldToScreen, AimbotAdvanced* aimbot) {
-    // Get overlay window size
-    RECT overlayRect = {};
-    GetWindowRect(overlayWindow, &overlayRect);
-    int overlayWidth = overlayRect.right - overlayRect.left;
-    int overlayHeight = overlayRect.bottom - overlayRect.top;
-    
-    // Fallback to screen size if window rect is garbage
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
-    if (overlayWidth < 100 || overlayHeight < 100 || 
-        overlayWidth > screenW + 100 || overlayHeight > screenH + 100) {
-        overlayWidth = screenW;
-        overlayHeight = screenH;
+    // Get initial overlay size
+    int overlayWidth = GetSystemMetrics(SM_CXSCREEN);
+    int overlayHeight = GetSystemMetrics(SM_CYSCREEN);
+
+    CS2WindowInfo cs2Info = FindCS2Window();
+    if (cs2Info.valid) {
+        overlayWidth = cs2Info.width;
+        overlayHeight = cs2Info.height;
     }
-    
+
     char sizeMsg[128];
-    sprintf_s(sizeMsg, "Overlay size: %dx%d", overlayWidth, overlayHeight);
+    sprintf_s(sizeMsg, "Initial overlay size: %dx%d", overlayWidth, overlayHeight);
     Log(sizeMsg);
-    
+
     // Initialize DirectX 11
     DXGI_SWAP_CHAIN_DESC scd = {};
     scd.BufferCount = 2;
     scd.BufferDesc.Width = overlayWidth;
     scd.BufferDesc.Height = overlayHeight;
     scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    scd.BufferDesc.RefreshRate.Numerator = 0;
-    scd.BufferDesc.RefreshRate.Denominator = 1;
     scd.SampleDesc.Count = 1;
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.OutputWindow = overlayWindow;
     scd.Windowed = TRUE;
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-    
+
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
     IDXGISwapChain* swapChain = nullptr;
     ID3D11RenderTargetView* renderTargetView = nullptr;
-    
+
     D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
                                    nullptr, 0, D3D11_SDK_VERSION, &scd,
                                    &swapChain, &device, nullptr, &context);
-    
+
     ID3D11Texture2D* backBuffer = nullptr;
     swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer);
     device->CreateRenderTargetView(backBuffer, nullptr, &renderTargetView);
     backBuffer->Release();
-    
+
     context->OMSetRenderTargets(1, &renderTargetView, nullptr);
-    
+
     D3D11_VIEWPORT vp = {0, 0, (float)overlayWidth, (float)overlayHeight, 0, 1};
     context->RSSetViewports(1, &vp);
-    
+
     // Initialize rendering components
     CD3D11Primitives primitives;
     primitives.Initialize(device, context, overlayWidth, overlayHeight);
-    
+
     CD3D11Renderer fontRenderer;
     fontRenderer.Initialize(device, context);
-    
+
     CESPRenderer espRenderer;
     espRenderer.Initialize(&primitives, &fontRenderer, worldToScreen, entityManager);
-    
+
     CHUDRenderer hudRenderer;
     hudRenderer.Initialize(&primitives, &fontRenderer, entityManager, aimbot);
-    
+
     CMenu menu;
     menu.Initialize(&primitives, &fontRenderer);
-    
-    // Setup menu
+
     menu.AddTab("ESP");
     menu.AddToggleItem("ESP", "Enabled", &espEnabled, "INSERT");
     menu.AddToggleItem("ESP", "Boxes", &espBoxes);
@@ -278,7 +225,7 @@ void RenderThread(HWND overlayWindow, HWND targetWindow,
     menu.AddToggleItem("ESP", "Snaplines", &espSnaplines);
     menu.AddToggleItem("ESP", "Head Dot", &espHeadDot);
     menu.AddToggleItem("ESP", "Show Teammates", &espShowTeammates);
-    
+
     menu.AddTab("AIMBOT");
     menu.AddToggleItem("AIMBOT", "Enabled", &aimbotEnabled);
     menu.AddSliderItem("AIMBOT", "Smoothing", &aimbotSmoothing, 1.0f, 20.0f, 0.5f);
@@ -288,26 +235,61 @@ void RenderThread(HWND overlayWindow, HWND targetWindow,
     menu.AddDropdownItem("AIMBOT", "Target Bone", &aimbotBone, boneOptions);
     menu.AddToggleItem("AIMBOT", "Visibility Check", &aimbotVisibilityCheck);
     menu.AddToggleItem("AIMBOT", "Target Lock", &aimbotTargetLock);
-    
-    // Load config
+
     menu.ReadConfig("cs2_tool.ini");
-    
+
+    g_cs2ProcessId = cs2ProcessId;
+    int frameCounter = 0;
+
     while (running) {
-        // Check if CS2 is in the foreground - hide overlay if not
-        bool cs2Active = IsCS2Foreground(targetWindow);
+        frameCounter++;
+
+        // Reposition overlay every 100 frames
+        if (frameCounter % 100 == 0) {
+            CS2WindowInfo info = FindCS2Window();
+            if (info.valid) {
+                SetWindowPos(overlayWindow, HWND_TOPMOST, info.x, info.y, info.width, info.height, SWP_NOACTIVATE);
+
+                if (info.width != overlayWidth || info.height != overlayHeight) {
+                    context->OMSetRenderTargets(0, nullptr, nullptr);
+                    if (renderTargetView) { renderTargetView->Release(); renderTargetView = nullptr; }
+
+                    swapChain->ResizeBuffers(0, info.width, info.height, DXGI_FORMAT_UNKNOWN, 0);
+
+                    ID3D11Texture2D* bb = nullptr;
+                    swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
+                    device->CreateRenderTargetView(bb, nullptr, &renderTargetView);
+                    bb->Release();
+
+                    context->OMSetRenderTargets(1, &renderTargetView, nullptr);
+
+                    D3D11_VIEWPORT newVp = {0, 0, (float)info.width, (float)info.height, 0, 1};
+                    context->RSSetViewports(1, &newVp);
+
+                    overlayWidth = info.width;
+                    overlayHeight = info.height;
+                    primitives.SetScreenSize(overlayWidth, overlayHeight);
+
+                    char resizeMsg[128];
+                    sprintf_s(resizeMsg, "Overlay resized to %dx%d", overlayWidth, overlayHeight);
+                    Log(resizeMsg);
+                }
+            }
+        }
+
+        // Check if CS2 is foreground
+        bool cs2Active = IsCS2Foreground(FindCS2Window().hwnd);
         if (cs2Active) {
-            // Show overlay (position is already correct from CreateOverlayWindow for fullscreen)
             ShowWindow(overlayWindow, SW_SHOW);
         } else {
-            // Hide overlay when CS2 is not focused
             ShowWindow(overlayWindow, SW_HIDE);
         }
-        
+
         // Handle menu input
         menu.SetOpen(menuOpen.load());
         menu.HandleInput();
-        
-        // Update ESP settings from menu
+
+        // Update settings
         ESPSettings espSettings;
         espSettings.boxes = espBoxes;
         espSettings.healthBar = espHealth;
@@ -319,8 +301,7 @@ void RenderThread(HWND overlayWindow, HWND targetWindow,
         espSettings.showTeammates = espShowTeammates;
         espSettings.aimbotFOV = aimbotFOV;
         espRenderer.SetSettings(espSettings);
-        
-        // Update aimbot settings
+
         AimbotSettings aimSettings;
         aimSettings.enabled = aimbotEnabled;
         aimSettings.smoothing = aimbotSmoothing;
@@ -330,43 +311,32 @@ void RenderThread(HWND overlayWindow, HWND targetWindow,
         aimSettings.visibilityCheck = aimbotVisibilityCheck;
         aimSettings.targetLock = aimbotTargetLock;
         aimbot->SetSettings(aimSettings);
-        
+
         if (cs2Active) {
-            // Clear screen - transparent (alpha 0)
-            float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             context->ClearRenderTargetView(renderTargetView, clearColor);
-            
-            // Update entity data
+
             {
                 std::lock_guard<std::mutex> lock(dataMutex);
                 entityManager->Update();
             }
-            
-            // Render ESP
+
             espRenderer.Render();
-            
-            // Render HUD
             hudRenderer.Render(overlayWidth, overlayHeight, menu.IsOpen());
-            
-            // Render menu
+
             if (menu.IsOpen()) {
                 menu.Draw(50, 50);
             }
-            
-            // Flush primitives
+
             primitives.Flush();
-            
-            // Present with VSync to reduce flickering
             swapChain->Present(1, 0);
         }
-        
+
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    
-    // Save config
+
     menu.WriteConfig("cs2_tool.ini");
-    
-    // Cleanup
+
     renderTargetView->Release();
     swapChain->Release();
     context->Release();
@@ -375,15 +345,11 @@ void RenderThread(HWND overlayWindow, HWND targetWindow,
 }
 
 int main() {
-    // Open debug log
     debugLog.open("C:\\cszzzz\\build\\bin\\Release\\debug_log.txt");
-    if (debugLog.is_open()) {
-        Log("Debug log opened successfully");
-    }
-    
+    if (debugLog.is_open()) Log("Debug log opened successfully");
+
     Log("CS2 External Tool - Starting...");
-    
-    // Attach to cs2.exe
+
     ProcessMemory process;
     try {
         Log("Attaching to cs2.exe...");
@@ -397,62 +363,90 @@ int main() {
         if (debugLog.is_open()) debugLog.close();
         return 1;
     }
-    
+
     char baseMsg[256];
     sprintf_s(baseMsg, "Client.dll base: 0x%llX", process.GetClientDllBase());
     Log(baseMsg);
     sprintf_s(baseMsg, "Engine2.dll base: 0x%llX", process.GetEngine2DllBase());
     Log(baseMsg);
-    
-    // Find CS2 window
-    HWND cs2Window = FindCS2Window();
+
+    // Get CS2 process ID
+    DWORD cs2Pid = 0;
+    {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        PROCESSENTRY32W pe = { sizeof(pe) };
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, L"cs2.exe") == 0) {
+                    cs2Pid = pe.th32ProcessID;
+                    break;
+                }
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+
+    if (!cs2Pid) {
+        Log("Failed to find cs2.exe process!");
+        system("pause");
+        return 1;
+    }
+
+    g_cs2ProcessId = cs2Pid;
+
+    // Find CS2 window via EnumWindows
+    Log("Searching for CS2 window...");
+    CS2WindowInfo cs2Info = {};
+    for (int i = 0; i < 30 && !cs2Info.valid; i++) {
+        cs2Info = FindCS2Window();
+        if (!cs2Info.valid) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+
+    HWND cs2Window = cs2Info.hwnd;
     if (!cs2Window) {
-        Log("Failed to find CS2 window!");
+        Log("Failed to find CS2 window after 30 attempts!");
         system("pause");
         if (debugLog.is_open()) debugLog.close();
         return 1;
     }
-    Log("Found CS2 window!");
-    
-    // Get CS2 window size for initialization
-    RECT initRect = {};
-    GetWindowRect(cs2Window, &initRect);
-    int initWidth = initRect.right - initRect.left;
-    int initHeight = initRect.bottom - initRect.top;
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
-    
-    bool isOffScreen = (initRect.left < -100 || initRect.top < -100 ||
-                       initRect.left > screenW + 100 || initRect.top > screenH + 100);
-    bool coversScreen = (initWidth >= screenW - 50 && initHeight >= screenH - 50);
-    
-    if (initWidth < 200 || initHeight < 200 || isOffScreen || coversScreen) {
-        initWidth = screenW;
-        initHeight = screenH;
+
+    char foundMsg[256];
+    sprintf_s(foundMsg, "Found CS2 window: client area=(%d,%d) size=%dx%d", cs2Info.x, cs2Info.y, cs2Info.width, cs2Info.height);
+    Log(foundMsg);
+
+    // Determine overlay size - use CS2 client area if valid, fallback to screen
+    int overlayWidth = GetSystemMetrics(SM_CXSCREEN);
+    int overlayHeight = GetSystemMetrics(SM_CYSCREEN);
+    int overlayX = 0;
+    int overlayY = 0;
+
+    if (cs2Info.valid) {
+        overlayX = cs2Info.x;
+        overlayY = cs2Info.y;
+        overlayWidth = cs2Info.width;
+        overlayHeight = cs2Info.height;
     }
-    
-    char initMsg[128];
-    sprintf_s(initMsg, "CS2 window size: %dx%d", initWidth, initHeight);
-    Log(initMsg);
-    
+
     // Initialize components
     EntityManager entityManager(process);
-    WorldToScreen worldToScreen(process, initWidth, initHeight);
+    WorldToScreen worldToScreen(process, overlayWidth, overlayHeight);
     AimbotAdvanced aimbot(process, worldToScreen, entityManager);
-    
-    // Create overlay window
-    HWND overlayWindow = CreateOverlayWindow(cs2Window);
-    
+
+    // Create overlay window at correct position/size
+    HWND overlayWindow = CreateOverlayWindow(overlayX, overlayY, overlayWidth, overlayHeight);
+
     // Start render thread
     Log("Starting render thread...");
-    std::thread renderThread(RenderThread, overlayWindow, cs2Window, 
+    std::thread renderThread(RenderThread, overlayWindow, cs2Pid,
                            &process, &entityManager, &worldToScreen, &aimbot);
-    
-    // Main loop
+
+    // Main loop - INSERT only toggles boolean, nothing else
     Log("Main loop started. Press INSERT to toggle menu, END to unload.");
-    
+
     static bool insertPressed = false;
-    
+
     while (running) {
         MSG msg;
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -464,40 +458,34 @@ int main() {
             DispatchMessage(&msg);
         }
         if (!running) break;
-        
-        // Check END key
+
         if (GetAsyncKeyState(VK_END) & 0x8000) {
             running = false;
             break;
         }
-        
-        // Check INSERT key - toggle menu
+
+        // INSERT key - only toggle menu boolean
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
             if (!insertPressed) {
                 menuOpen = !menuOpen;
                 insertPressed = true;
-                char menuMsg[64];
-                sprintf_s(menuMsg, "Menu %s", menuOpen ? "opened" : "closed");
-                Log(menuMsg);
             }
         } else {
             insertPressed = false;
         }
-        
-        // Aimbot logic
+
         if (aimbotEnabled && (GetAsyncKeyState(aimKey) & 0x8000)) {
             aimbot.Aim();
         }
-        
+
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    
-    // Wait for render thread
+
     renderThread.join();
-    
+
     Log("Tool unloaded successfully.");
     if (debugLog.is_open()) debugLog.close();
     system("pause");
-    
+
     return 0;
 }
