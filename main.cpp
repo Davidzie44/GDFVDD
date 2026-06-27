@@ -138,7 +138,9 @@ HWND CreateOverlayWindow(int x, int y, int w, int h) {
         nullptr, nullptr, GetModuleHandle(nullptr), nullptr
     );
 
-    SetLayeredWindowAttributes(hwnd, RGB(255, 0, 255), 0, LWA_COLORKEY);
+    MARGINS margins = {-1, -1, -1, -1};
+    DwmExtendFrameIntoClientArea(hwnd, &margins);
+    
     SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_TRANSPARENT | WS_EX_LAYERED);
 
     ShowWindow(hwnd, SW_SHOW);
@@ -240,6 +242,7 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
 
     g_cs2ProcessId = cs2ProcessId;
     int frameCounter = 0;
+    HWND cachedCS2Hwnd = cs2Info.hwnd;
 
     while (running) {
         frameCounter++;
@@ -248,6 +251,7 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
         if (frameCounter % 100 == 0) {
             CS2WindowInfo info = FindCS2Window();
             if (info.valid) {
+                cachedCS2Hwnd = info.hwnd;
                 SetWindowPos(overlayWindow, HWND_TOPMOST, info.x, info.y, info.width, info.height, SWP_NOACTIVATE);
 
                 if (info.width != overlayWidth || info.height != overlayHeight) {
@@ -278,7 +282,7 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
         }
 
         // Check if CS2 is foreground - only toggle visibility on state change
-        bool cs2Active = IsCS2Foreground(FindCS2Window().hwnd);
+        bool cs2Active = IsCS2Foreground(cachedCS2Hwnd);
         static bool lastCs2Active = false;
         if (cs2Active != lastCs2Active) {
             ShowWindow(overlayWindow, cs2Active ? SW_SHOW : SW_HIDE);
@@ -313,7 +317,7 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
         aimbot->SetSettings(aimSettings);
 
         if (cs2Active) {
-            const float clearColor[4] = {1.0f, 0.0f, 1.0f, 0.0f};
+            const float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             context->ClearRenderTargetView(renderTargetView, clearColor);
 
             {
