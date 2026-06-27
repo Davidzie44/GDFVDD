@@ -91,10 +91,9 @@ CS2WindowInfo FindCS2Window() {
 bool IsCS2Foreground(HWND cs2Window) {
     HWND foreground = GetForegroundWindow();
     if (!foreground) return false;
-    if (foreground == cs2Window) return true;
-    HWND parent = GetParent(foreground);
-    if (parent == cs2Window) return true;
-    return false;
+    DWORD fgPid = 0;
+    GetWindowThreadProcessId(foreground, &fgPid);
+    return (fgPid == g_cs2ProcessId);
 }
 
 // Settings
