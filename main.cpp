@@ -138,7 +138,7 @@ HWND CreateOverlayWindow(int x, int y, int w, int h) {
         nullptr, nullptr, GetModuleHandle(nullptr), nullptr
     );
 
-    SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
+    SetLayeredWindowAttributes(hwnd, RGB(255, 0, 255), 0, LWA_COLORKEY);
     SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_TRANSPARENT | WS_EX_LAYERED);
 
     ShowWindow(hwnd, SW_SHOW);
@@ -277,12 +277,12 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
             }
         }
 
-        // Check if CS2 is foreground
+        // Check if CS2 is foreground - only toggle visibility on state change
         bool cs2Active = IsCS2Foreground(FindCS2Window().hwnd);
-        if (cs2Active) {
-            ShowWindow(overlayWindow, SW_SHOW);
-        } else {
-            ShowWindow(overlayWindow, SW_HIDE);
+        static bool lastCs2Active = false;
+        if (cs2Active != lastCs2Active) {
+            ShowWindow(overlayWindow, cs2Active ? SW_SHOW : SW_HIDE);
+            lastCs2Active = cs2Active;
         }
 
         // Handle menu input
@@ -313,7 +313,7 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
         aimbot->SetSettings(aimSettings);
 
         if (cs2Active) {
-            const float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const float clearColor[4] = {1.0f, 0.0f, 1.0f, 0.0f};
             context->ClearRenderTargetView(renderTargetView, clearColor);
 
             {
