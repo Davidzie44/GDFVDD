@@ -178,7 +178,7 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.OutputWindow = overlayWindow;
     scd.Windowed = TRUE;
-    scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
