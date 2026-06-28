@@ -245,10 +245,12 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
             break;
         }
 
-        // Track game window
-        if (IsCS2Foreground()) {
+        // Track game window - always update position, only hide when menu closed
+        {
             CS2WindowRect r = GetCS2ClientRect(cs2Hwnd);
-            if (r.w > 100 && r.h > 100) {
+            bool cs2Active = IsCS2Foreground();
+
+            if (cs2Active && r.w > 100 && r.h > 100) {
                 SetWindowPos(overlayWindow, HWND_TOPMOST, r.x, r.y, r.w, r.h, SWP_NOACTIVATE);
 
                 if (r.w != overlayWidth || r.h != overlayHeight) {
@@ -263,9 +265,12 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
                     worldToScreen->SetScreenSize(overlayWidth, overlayHeight);
                 }
             }
-            ShowWindow(overlayWindow, SW_SHOW);
-        } else {
-            ShowWindow(overlayWindow, SW_HIDE);
+
+            if (cs2Active || menuOpen.load()) {
+                ShowWindow(overlayWindow, SW_SHOW);
+            } else {
+                ShowWindow(overlayWindow, SW_HIDE);
+            }
         }
 
         if (frameCount <= 3 || frameCount % 300 == 0) {
@@ -290,6 +295,15 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
         // --- Draw ESP ---
         if (espEnabled) {
             ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+
+            // Draw FOV circle
+            if (aimbotEnabled) {
+                float centerX = overlayWidth / 2.0f;
+                float centerY = overlayHeight / 2.0f;
+                float fovRadius = aimbotFOV * 5.0f;
+                drawList->AddCircle(ImVec2(centerX, centerY), fovRadius, IM_COL32(255, 255, 255, 80), 64, 1.0f);
+            }
+
             const PlayerData& localPlayer = entityManager->GetLocalPlayer();
             if (localPlayer.isAlive) {
                 auto players = entityManager->GetAllPlayers();
