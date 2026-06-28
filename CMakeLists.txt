@@ -4,58 +4,42 @@ project(CS2ExternalTool)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Source files
+# ImGui sources
+set(IMGUI_SOURCES
+    imgui/imgui.cpp
+    imgui/imgui_draw.cpp
+    imgui/imgui_tables.cpp
+    imgui/imgui_widgets.cpp
+    imgui/imgui_impl_win32.cpp
+    imgui/imgui_impl_dx11.cpp
+)
+
+# Main sources
 set(SOURCES
     main.cpp
+    ${IMGUI_SOURCES}
 )
 
-# Header files (for IDE purposes)
-set(HEADERS
-    ProcessMemory.h
-    Offsets.h
-    CS2Entities.h
-    WorldToScreen.h
-    PatternScanner.h
-    EntityManager.h
-    AimbotAdvanced.h
-    MenuSystem.h
-    ESPRenderer.h
-    HUDRenderer.h
-    PrimitivesRenderer.h
-    FontRenderer.h
-    Config.h
-    Overlay.h
-    ESP.h
-    Aimbot.h
+add_executable(${PROJECT_NAME} WIN32 ${SOURCES})
+
+target_include_directories(${PROJECT_NAME} PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/imgui
 )
 
-# Create executable
-add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS})
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    d3d11.lib
+    dxgi.lib
+    dwmapi.lib
+    d3dcompiler.lib
+)
 
-# Link libraries
-if(WIN32)
-    target_link_libraries(${PROJECT_NAME} 
-        d3d11.lib
-        dxgi.lib
-        gdi32.lib
-        dwmapi.lib
-        d3dcompiler.lib
-    )
-    
-    # Set subsystem to Windows (no console)
-    # Comment out the next line if you want to see console output
-    # set_target_properties(${PROJECT_NAME} PROPERTIES WIN32_EXECUTABLE TRUE)
-    
-    # Set output directory
-    set_target_properties(${PROJECT_NAME} PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-    )
-endif()
+set_target_properties(${PROJECT_NAME} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
 
-# Compiler flags
 if(MSVC)
-    target_compile_options(${PROJECT_NAME} PRIVATE
-        /W4
-        /permissive-
-    )
+    target_compile_options(${PROJECT_NAME} PRIVATE /W3)
+    # Suppress warnings in ImGui
+    set_source_files_properties(${IMGUI_SOURCES} PROPERTIES COMPILE_FLAGS "/W0")
 endif()

@@ -7,49 +7,28 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
-#include <fstream>
-#include <iostream>
+#include <cmath>
+
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx11.h"
 
 #include "ProcessMemory.h"
 #include "CS2Entities.h"
 #include "WorldToScreen.h"
 #include "EntityManager.h"
 #include "AimbotAdvanced.h"
-#include "PrimitivesRenderer.h"
-#include "FontRenderer.h"
-#include "MenuSystem.h"
-#include "ESPRenderer.h"
-#include "HUDRenderer.h"
+#include "Offsets.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dwmapi.lib")
 
-// Debug logging
-std::ofstream debugLog;
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-void Log(const char* message) {
-    printf("%s\n", message);
-    if (debugLog.is_open()) {
-        debugLog << message << std::endl;
-        debugLog.flush();
-    }
-}
-
-// Global state
 std::atomic<bool> running(true);
 std::atomic<bool> menuOpen(false);
 std::mutex dataMutex;
-
-// CS2 window info from EnumWindows
-struct CS2WindowInfo {
-    HWND hwnd = NULL;
-    int width = 0;
-    int height = 0;
-    int x = 0;
-    int y = 0;
-    bool valid = false;
-};
 
 DWORD g_cs2ProcessId = 0;
 
@@ -65,35 +44,44 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     RECT rect;
     if (!GetClientRect(hwnd, &rect)) return TRUE;
 
-    CS2WindowInfo* info = (CS2WindowInfo*)lParam;
     POINT topLeft = { rect.left, rect.top };
     ClientToScreen(hwnd, &topLeft);
 
-    info->hwnd = hwnd;
-    info->x = topLeft.x;
-    info->y = topLeft.y;
-    info->width = rect.right - rect.left;
-    info->height = rect.bottom - rect.top;
+    HWND* outHwnd = (HWND*)lParam;
+    int w = rect.right - rect.left;
+    int h = rect.bottom - rect.top;
 
-    if (info->width > 800 && info->height > 600 && info->x >= 0 && info->x < 5000) {
-        info->valid = true;
+    if (w > 800 && h > 600 && topLeft.x >= 0 && topLeft.x < 5000) {
+        *outHwnd = hwnd;
+        return FALSE;
     }
-
     return TRUE;
 }
 
-CS2WindowInfo FindCS2Window() {
-    CS2WindowInfo info;
-    EnumWindows(EnumWindowsProc, (LPARAM)&info);
-    return info;
+HWND FindCS2Window() {
+    HWND hwnd = NULL;
+    EnumWindows(EnumWindowsProc, (LPARAM)&hwnd);
+    return hwnd;
 }
 
-bool IsCS2Foreground(HWND cs2Window) {
-    HWND foreground = GetForegroundWindow();
-    if (!foreground) return false;
+bool IsCS2Foreground() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
     DWORD fgPid = 0;
-    GetWindowThreadProcessId(foreground, &fgPid);
+    GetWindowThreadProcessId(fg, &fgPid);
     return (fgPid == g_cs2ProcessId);
+}
+
+struct CS2WindowRect {
+    int x, y, w, h;
+};
+
+CS2WindowRect GetCS2ClientRect(HWND cs2Hwnd) {
+    RECT rect;
+    GetClientRect(cs2Hwnd, &rect);
+    POINT pt = { 0, 0 };
+    ClientToScreen(cs2Hwnd, &pt);
+    return { pt.x, pt.y, rect.right - rect.left, rect.bottom - rect.top };
 }
 
 // Settings
@@ -114,195 +102,239 @@ float aimbotRCS = 2.0f;
 int aimbotBone = 0;
 bool aimbotVisibilityCheck = false;
 bool aimbotTargetLock = false;
-
 int aimKey = VK_XBUTTON1;
 
-// DirectX 11 Overlay Window
-HWND CreateOverlayWindow(int x, int y, int w, int h) {
-    WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(WNDCLASSEXW);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = DefWindowProcW;
-    wc.hInstance = GetModuleHandle(nullptr);
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = NULL;
-    wc.lpszClassName = L"CS2Overlay";
+LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        return true;
 
-    RegisterClassExW(&wc);
-
-    HWND hwnd = CreateWindowExW(
-        WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        L"CS2Overlay", L"CS2 Tool", WS_POPUP,
-        x, y, w, h,
-        nullptr, nullptr, GetModuleHandle(nullptr), nullptr
-    );
-
-    MARGINS margins = {-1, 0, 0, 0};
-    DwmExtendFrameIntoClientArea(hwnd, &margins);
-
-    ShowWindow(hwnd, SW_SHOWDEFAULT);
-    UpdateWindow(hwnd);
-
-    char msg[256];
-    sprintf_s(msg, "Overlay created at (%d, %d) size %dx%d", x, y, w, h);
-    Log(msg);
-    return hwnd;
+    switch (msg) {
+    case WM_DESTROY:
+        running = false;
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-// Render thread
 void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
                   ProcessMemory* process, EntityManager* entityManager,
                   WorldToScreen* worldToScreen, AimbotAdvanced* aimbot) {
-    // Get initial overlay size
-    int overlayWidth = GetSystemMetrics(SM_CXSCREEN);
-    int overlayHeight = GetSystemMetrics(SM_CYSCREEN);
 
-    CS2WindowInfo cs2Info = FindCS2Window();
-    if (cs2Info.valid) {
-        overlayWidth = cs2Info.width;
-        overlayHeight = cs2Info.height;
+    HWND cs2Hwnd = FindCS2Window();
+    if (!cs2Hwnd) {
+        running = false;
+        return;
     }
 
-    char sizeMsg[128];
-    sprintf_s(sizeMsg, "Initial overlay size: %dx%d", overlayWidth, overlayHeight);
-    Log(sizeMsg);
+    CS2WindowRect cs2Rect = GetCS2ClientRect(cs2Hwnd);
+    int overlayWidth = cs2Rect.w;
+    int overlayHeight = cs2Rect.h;
 
-    // Initialize DirectX 11
+    // D3D11 setup
     DXGI_SWAP_CHAIN_DESC scd = {};
     scd.BufferCount = 2;
-    scd.BufferDesc.Width = overlayWidth;
-    scd.BufferDesc.Height = overlayHeight;
     scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    scd.SampleDesc.Count = 1;
+    scd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.OutputWindow = overlayWindow;
+    scd.SampleDesc.Count = 1;
     scd.Windowed = TRUE;
     scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
     IDXGISwapChain* swapChain = nullptr;
-    ID3D11RenderTargetView* renderTargetView = nullptr;
+    ID3D11RenderTargetView* rtv = nullptr;
 
-    D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-                                   nullptr, 0, D3D11_SDK_VERSION, &scd,
-                                   &swapChain, &device, nullptr, &context);
+    D3D_FEATURE_LEVEL featureLevel;
+    const D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+        featureLevels, 2, D3D11_SDK_VERSION, &scd, &swapChain, &device, &featureLevel, &context);
+    if (FAILED(hr)) {
+        running = false;
+        return;
+    }
 
     ID3D11Texture2D* backBuffer = nullptr;
     swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer);
-    device->CreateRenderTargetView(backBuffer, nullptr, &renderTargetView);
+    device->CreateRenderTargetView(backBuffer, nullptr, &rtv);
     backBuffer->Release();
 
-    context->OMSetRenderTargets(1, &renderTargetView, nullptr);
+    // ImGui init
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.IniFilename = nullptr;
+    ImGui::StyleColorsDark();
 
-    D3D11_VIEWPORT vp = {0, 0, (float)overlayWidth, (float)overlayHeight, 0, 1};
-    context->RSSetViewports(1, &vp);
-
-    // Initialize rendering components
-    CD3D11Primitives primitives;
-    primitives.Initialize(device, context, overlayWidth, overlayHeight);
-
-    CD3D11Renderer fontRenderer;
-    fontRenderer.Initialize(device, context);
-
-    CESPRenderer espRenderer;
-    espRenderer.Initialize(&primitives, &fontRenderer, worldToScreen, entityManager);
-
-    CHUDRenderer hudRenderer;
-    hudRenderer.Initialize(&primitives, &fontRenderer, entityManager, aimbot);
-
-    CMenu menu;
-    menu.Initialize(&primitives, &fontRenderer);
-
-    menu.AddTab("ESP");
-    menu.AddToggleItem("ESP", "Enabled", &espEnabled, "INSERT");
-    menu.AddToggleItem("ESP", "Boxes", &espBoxes);
-    menu.AddToggleItem("ESP", "Health Bar", &espHealth);
-    menu.AddToggleItem("ESP", "Name", &espName);
-    menu.AddToggleItem("ESP", "Weapon", &espWeapon);
-    menu.AddToggleItem("ESP", "Distance", &espDistance);
-    menu.AddToggleItem("ESP", "Snaplines", &espSnaplines);
-    menu.AddToggleItem("ESP", "Head Dot", &espHeadDot);
-    menu.AddToggleItem("ESP", "Show Teammates", &espShowTeammates);
-
-    menu.AddTab("AIMBOT");
-    menu.AddToggleItem("AIMBOT", "Enabled", &aimbotEnabled);
-    menu.AddSliderItem("AIMBOT", "Smoothing", &aimbotSmoothing, 1.0f, 20.0f, 0.5f);
-    menu.AddSliderItem("AIMBOT", "FOV", &aimbotFOV, 1.0f, 180.0f, 1.0f);
-    menu.AddSliderItem("AIMBOT", "RCS", &aimbotRCS, 0.0f, 2.0f, 0.1f);
-    std::vector<std::string> boneOptions = {"Head", "Neck", "Chest", "Pelvis", "Feet"};
-    menu.AddDropdownItem("AIMBOT", "Target Bone", &aimbotBone, boneOptions);
-    menu.AddToggleItem("AIMBOT", "Visibility Check", &aimbotVisibilityCheck);
-    menu.AddToggleItem("AIMBOT", "Target Lock", &aimbotTargetLock);
-
-    menu.ReadConfig("cs2_tool.ini");
+    ImGui_ImplWin32_Init(overlayWindow);
+    ImGui_ImplDX11_Init(device, context);
 
     g_cs2ProcessId = cs2ProcessId;
-    int frameCounter = 0;
-    HWND cachedCS2Hwnd = cs2Info.hwnd;
+
+    bool prevInsert = false;
 
     while (running) {
-        frameCounter++;
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) { running = false; break; }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        if (!running) break;
 
-        // Reposition overlay every 100 frames
-        if (frameCounter % 100 == 0) {
-            CS2WindowInfo info = FindCS2Window();
-            if (info.valid) {
-                cachedCS2Hwnd = info.hwnd;
-                SetWindowPos(overlayWindow, HWND_TOPMOST, info.x, info.y, info.width, info.height, SWP_NOACTIVATE);
+        // INSERT key toggle
+        bool curInsert = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+        if (curInsert && !prevInsert) {
+            menuOpen = !menuOpen;
+            LONG ex = GetWindowLong(overlayWindow, GWL_EXSTYLE);
+            if (menuOpen)
+                SetWindowLong(overlayWindow, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT);
+            else
+                SetWindowLong(overlayWindow, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT);
+        }
+        prevInsert = curInsert;
 
-                if (info.width != overlayWidth || info.height != overlayHeight) {
-                    context->OMSetRenderTargets(0, nullptr, nullptr);
-                    if (renderTargetView) { renderTargetView->Release(); renderTargetView = nullptr; }
+        if (GetAsyncKeyState(VK_END) & 0x8000) {
+            running = false;
+            break;
+        }
 
-                    swapChain->ResizeBuffers(0, info.width, info.height, DXGI_FORMAT_UNKNOWN, 0);
+        // Track game window
+        if (IsCS2Foreground()) {
+            CS2WindowRect r = GetCS2ClientRect(cs2Hwnd);
+            if (r.w > 100 && r.h > 100) {
+                SetWindowPos(overlayWindow, HWND_TOPMOST, r.x, r.y, r.w, r.h, SWP_NOACTIVATE);
 
+                if (r.w != overlayWidth || r.h != overlayHeight) {
+                    overlayWidth = r.w;
+                    overlayHeight = r.h;
+                    if (rtv) { rtv->Release(); rtv = nullptr; }
+                    swapChain->ResizeBuffers(0, overlayWidth, overlayHeight, DXGI_FORMAT_UNKNOWN, 0);
                     ID3D11Texture2D* bb = nullptr;
                     swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
-                    device->CreateRenderTargetView(bb, nullptr, &renderTargetView);
+                    device->CreateRenderTargetView(bb, nullptr, &rtv);
                     bb->Release();
+                    worldToScreen->SetScreenSize(overlayWidth, overlayHeight);
+                }
+            }
+            ShowWindow(overlayWindow, SW_SHOW);
+        } else {
+            ShowWindow(overlayWindow, SW_HIDE);
+        }
 
-                    context->OMSetRenderTargets(1, &renderTargetView, nullptr);
+        // Update entity data
+        {
+            std::lock_guard<std::mutex> lock(dataMutex);
+            entityManager->Update();
+        }
 
-                    D3D11_VIEWPORT newVp = {0, 0, (float)info.width, (float)info.height, 0, 1};
-                    context->RSSetViewports(1, &newVp);
+        // ImGui new frame
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
 
-                    overlayWidth = info.width;
-                    overlayHeight = info.height;
-                    primitives.SetScreenSize(overlayWidth, overlayHeight);
+        // --- Draw ESP ---
+        if (espEnabled) {
+            ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+            const PlayerData& localPlayer = entityManager->GetLocalPlayer();
+            if (localPlayer.isAlive) {
+                auto players = entityManager->GetAllPlayers();
+                for (const auto& player : players) {
+                    if (player.team == localPlayer.team && !espShowTeammates) continue;
+                    if (!player.isAlive || player.isDormant) continue;
 
-                    char resizeMsg[128];
-                    sprintf_s(resizeMsg, "Overlay resized to %dx%d", overlayWidth, overlayHeight);
-                    Log(resizeMsg);
+                    bool isEnemy = (player.team != localPlayer.team);
+                    ImU32 espColor = isEnemy ? IM_COL32(255, 50, 50, 255) : IM_COL32(50, 255, 50, 255);
+
+                    Vector3 screenHead, screenFoot;
+                    bool headOk = worldToScreen->WorldToScreenPoint(player.headPosition, screenHead);
+                    bool footOk = worldToScreen->WorldToScreenPoint(player.position, screenFoot);
+                    if (!headOk || !footOk) continue;
+
+                    float boxH = std::abs(screenHead.y - screenFoot.y) * 1.2f;
+                    float boxW = boxH * 0.6f;
+                    float boxX = screenHead.x - boxW / 2.0f;
+                    float boxY = screenHead.y;
+
+                    if (espBoxes) {
+                        drawList->AddRect(ImVec2(boxX, boxY), ImVec2(boxX + boxW, boxY + boxH), espColor);
+                    }
+
+                    if (espHealth) {
+                        float hp = (float)player.health / 100.0f;
+                        ImU32 hpColor = hp > 0.5f ? IM_COL32(255, 255 * (1.0f - (hp - 0.5f) * 2.0f), 0, 255)
+                                                   : IM_COL32(255, 255 * hp * 2.0f, 0, 255);
+                        drawList->AddRectFilled(ImVec2(boxX - 5, boxY), ImVec2(boxX - 1, boxY + boxH), IM_COL32(0, 0, 0, 200));
+                        drawList->AddRectFilled(ImVec2(boxX - 5, boxY + boxH * (1.0f - hp)), ImVec2(boxX - 1, boxY + boxH), hpColor);
+                    }
+
+                    if (espName && !player.name.empty()) {
+                        ImVec2 textSize = ImGui::CalcTextSize(player.name.c_str());
+                        drawList->AddText(ImVec2(boxX + boxW / 2 - textSize.x / 2, boxY - textSize.y - 2), IM_COL32(255, 255, 255, 255), player.name.c_str());
+                    }
+
+                    if (espDistance) {
+                        char distStr[32];
+                        sprintf_s(distStr, "%.0fm", player.distance);
+                        ImVec2 textSize = ImGui::CalcTextSize(distStr);
+                        drawList->AddText(ImVec2(boxX + boxW / 2 - textSize.x / 2, boxY + boxH + 2), IM_COL32(200, 200, 200, 255), distStr);
+                    }
+
+                    if (espSnaplines) {
+                        ImVec2 center(overlayWidth / 2.0f, overlayHeight);
+                        drawList->AddLine(center, ImVec2(screenFoot.x, screenFoot.y), espColor);
+                    }
+
+                    if (espHeadDot) {
+                        drawList->AddCircleFilled(ImVec2(screenHead.x, screenHead.y), 3.0f, IM_COL32(255, 0, 0, 255), 16);
+                    }
                 }
             }
         }
 
-        // Check if CS2 is foreground - only toggle visibility on state change
-        bool cs2Active = IsCS2Foreground(cachedCS2Hwnd);
-        static bool lastCs2Active = false;
-        if (cs2Active != lastCs2Active) {
-            ShowWindow(overlayWindow, cs2Active ? SW_SHOW : SW_HIDE);
-            lastCs2Active = cs2Active;
+        // --- Draw Menu ---
+        if (menuOpen) {
+            ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Once);
+            ImGui::SetNextWindowPos(ImVec2(50, 50), ImGuiCond_Once);
+            ImGui::Begin("CS2 Tool", nullptr,
+                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar);
+
+            if (ImGui::BeginTabBar("Tabs")) {
+                if (ImGui::BeginTabItem("ESP")) {
+                    ImGui::Checkbox("Enabled", &espEnabled);
+                    ImGui::Checkbox("Boxes", &espBoxes);
+                    ImGui::Checkbox("Health Bar", &espHealth);
+                    ImGui::Checkbox("Name", &espName);
+                    ImGui::Checkbox("Weapon", &espWeapon);
+                    ImGui::Checkbox("Distance", &espDistance);
+                    ImGui::Checkbox("Snaplines", &espSnaplines);
+                    ImGui::Checkbox("Head Dot", &espHeadDot);
+                    ImGui::Checkbox("Show Teammates", &espShowTeammates);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Aimbot")) {
+                    ImGui::Checkbox("Enabled", &aimbotEnabled);
+                    ImGui::SliderFloat("Smoothing", &aimbotSmoothing, 1.0f, 20.0f);
+                    ImGui::SliderFloat("FOV", &aimbotFOV, 1.0f, 180.0f);
+                    ImGui::SliderFloat("RCS", &aimbotRCS, 0.0f, 2.0f);
+                    const char* bones[] = { "Head", "Neck", "Chest", "Pelvis", "Feet" };
+                    ImGui::Combo("Target Bone", &aimbotBone, bones, IM_ARRAYSIZE(bones));
+                    ImGui::Checkbox("Visibility Check", &aimbotVisibilityCheck);
+                    ImGui::Checkbox("Target Lock", &aimbotTargetLock);
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Press INSERT to toggle menu");
+            ImGui::End();
         }
 
-        // Handle menu input
-        menu.SetOpen(menuOpen.load());
-        menu.HandleInput();
-
         // Update settings
-        ESPSettings espSettings;
-        espSettings.boxes = espBoxes;
-        espSettings.healthBar = espHealth;
-        espSettings.name = espName;
-        espSettings.weapon = espWeapon;
-        espSettings.distance = espDistance;
-        espSettings.snaplines = espSnaplines;
-        espSettings.headDot = espHeadDot;
-        espSettings.showTeammates = espShowTeammates;
-        espSettings.aimbotFOV = aimbotFOV;
-        espRenderer.SetSettings(espSettings);
-
         AimbotSettings aimSettings;
         aimSettings.enabled = aimbotEnabled;
         aimSettings.smoothing = aimbotSmoothing;
@@ -313,65 +345,36 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
         aimSettings.targetLock = aimbotTargetLock;
         aimbot->SetSettings(aimSettings);
 
-        if (cs2Active) {
-            const float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            context->ClearRenderTargetView(renderTargetView, clearColor);
-
-            {
-                std::lock_guard<std::mutex> lock(dataMutex);
-                entityManager->Update();
-            }
-
-            espRenderer.Render();
-            hudRenderer.Render(overlayWidth, overlayHeight, menu.IsOpen());
-
-            if (menu.IsOpen()) {
-                menu.Draw(50, 50);
-            }
-
-            primitives.Flush();
-            swapChain->Present(1, 0);
-        }
+        // Render
+        ImGui::Render();
+        const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        context->OMSetRenderTargets(1, &rtv, nullptr);
+        context->ClearRenderTargetView(rtv, clearColor);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        swapChain->Present(1, 0);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    menu.WriteConfig("cs2_tool.ini");
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
 
-    renderTargetView->Release();
+    if (rtv) rtv->Release();
     swapChain->Release();
     context->Release();
     device->Release();
-    DestroyWindow(overlayWindow);
 }
 
-int main() {
-    debugLog.open("C:\\cszzzz\\build\\bin\\Release\\debug_log.txt");
-    if (debugLog.is_open()) Log("Debug log opened successfully");
-
-    Log("CS2 External Tool - Starting...");
-
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     ProcessMemory process;
     try {
-        Log("Attaching to cs2.exe...");
         process.Attach(L"cs2.exe");
-        Log("Attached successfully!");
-    } catch (const std::exception& e) {
-        char errorMsg[256];
-        sprintf_s(errorMsg, "Failed to attach: %s", e.what());
-        Log(errorMsg);
-        system("pause");
-        if (debugLog.is_open()) debugLog.close();
+    } catch (const std::exception&) {
+        MessageBoxW(nullptr, L"Failed to attach to cs2.exe.\nLaunch CS2 first.", L"Error", MB_ICONERROR | MB_OK);
         return 1;
     }
 
-    char baseMsg[256];
-    sprintf_s(baseMsg, "Client.dll base: 0x%llX", process.GetClientDllBase());
-    Log(baseMsg);
-    sprintf_s(baseMsg, "Engine2.dll base: 0x%llX", process.GetEngine2DllBase());
-    Log(baseMsg);
-
-    // Get CS2 process ID
     DWORD cs2Pid = 0;
     {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -386,109 +389,59 @@ int main() {
         }
         CloseHandle(snap);
     }
-
     if (!cs2Pid) {
-        Log("Failed to find cs2.exe process!");
-        system("pause");
+        MessageBoxW(nullptr, L"cs2.exe not found.", L"Error", MB_ICONERROR | MB_OK);
         return 1;
     }
-
     g_cs2ProcessId = cs2Pid;
 
-    // Find CS2 window via EnumWindows
-    Log("Searching for CS2 window...");
-    CS2WindowInfo cs2Info = {};
-    for (int i = 0; i < 30 && !cs2Info.valid; i++) {
-        cs2Info = FindCS2Window();
-        if (!cs2Info.valid) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
+    HWND cs2Hwnd = NULL;
+    for (int i = 0; i < 30 && !cs2Hwnd; i++) {
+        cs2Hwnd = FindCS2Window();
+        if (!cs2Hwnd) std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-
-    HWND cs2Window = cs2Info.hwnd;
-    if (!cs2Window) {
-        Log("Failed to find CS2 window after 30 attempts!");
-        system("pause");
-        if (debugLog.is_open()) debugLog.close();
+    if (!cs2Hwnd) {
+        MessageBoxW(nullptr, L"Failed to find CS2 window.", L"Error", MB_ICONERROR | MB_OK);
         return 1;
     }
 
-    char foundMsg[256];
-    sprintf_s(foundMsg, "Found CS2 window: client area=(%d,%d) size=%dx%d", cs2Info.x, cs2Info.y, cs2Info.width, cs2Info.height);
-    Log(foundMsg);
+    CS2WindowRect cs2Rect = GetCS2ClientRect(cs2Hwnd);
 
-    // Determine overlay size - use CS2 client area if valid, fallback to screen
-    int overlayWidth = GetSystemMetrics(SM_CXSCREEN);
-    int overlayHeight = GetSystemMetrics(SM_CYSCREEN);
-    int overlayX = 0;
-    int overlayY = 0;
+    // Create overlay window - EXACT pattern from working projects
+    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, OverlayWndProc, 0L, 0L, GetModuleHandle(NULL), NULL, NULL, NULL, NULL, L"CS2Overlay", NULL };
+    RegisterClassExW(&wc);
 
-    if (cs2Info.valid) {
-        overlayX = cs2Info.x;
-        overlayY = cs2Info.y;
-        overlayWidth = cs2Info.width;
-        overlayHeight = cs2Info.height;
-    }
+    HWND overlayWindow = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED,
+        L"CS2Overlay", L"CS2 Tool", WS_POPUP,
+        cs2Rect.x, cs2Rect.y, cs2Rect.w, cs2Rect.h,
+        nullptr, nullptr, GetModuleHandle(NULL), nullptr
+    );
 
-    // Initialize components
+    SetLayeredWindowAttributes(overlayWindow, RGB(0, 0, 0), 0, LWA_COLORKEY);
+    MARGINS m = { -1, -1, -1, -1 };
+    DwmExtendFrameIntoClientArea(overlayWindow, &m);
+    ShowWindow(overlayWindow, SW_SHOWDEFAULT);
+    UpdateWindow(overlayWindow);
+
     EntityManager entityManager(process);
-    WorldToScreen worldToScreen(process, overlayWidth, overlayHeight);
+    WorldToScreen worldToScreen(process, cs2Rect.w, cs2Rect.h);
     AimbotAdvanced aimbot(process, worldToScreen, entityManager);
 
-    // Create overlay window at correct position/size
-    HWND overlayWindow = CreateOverlayWindow(overlayX, overlayY, overlayWidth, overlayHeight);
-
-    // Start render thread
-    Log("Starting render thread...");
     std::thread renderThread(RenderThread, overlayWindow, cs2Pid,
-                           &process, &entityManager, &worldToScreen, &aimbot);
+        &process, &entityManager, &worldToScreen, &aimbot);
 
-    // Main loop - INSERT only toggles boolean, nothing else
-    Log("Main loop started. Press INSERT to toggle menu, END to unload.");
-
-    static bool insertPressed = false;
-
+    // Main loop - just pump messages
     while (running) {
         MSG msg;
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) {
-                running = false;
-                break;
-            }
+            if (msg.message == WM_QUIT) { running = false; break; }
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
-        if (!running) break;
-
-        if (GetAsyncKeyState(VK_END) & 0x8000) {
-            running = false;
-            break;
-        }
-
-        // INSERT key - only toggle menu boolean
-        if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
-            if (!insertPressed) {
-                menuOpen = !menuOpen;
-                insertPressed = true;
-                if (menuOpen) Log("Menu opened");
-                else Log("Menu closed");
-            }
-        } else {
-            insertPressed = false;
-        }
-
-        if (aimbotEnabled && (GetAsyncKeyState(aimKey) & 0x8000)) {
-            aimbot.Aim();
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     renderThread.join();
-
-    Log("Tool unloaded successfully.");
-    if (debugLog.is_open()) debugLog.close();
-    system("pause");
-
     return 0;
 }
