@@ -128,13 +128,18 @@ bool espHeadDot = true;
 bool espShowTeammates = false;
 
 bool aimbotEnabled = false;
-float aimbotSmoothing = 2.0f;
-float aimbotFOV = 15.0f;
+float aimbotSmoothing = 1.0f;
+float aimbotFOV = 30.0f;
 float aimbotRCS = 2.0f;
 int aimbotBone = 0;
 bool aimbotVisibilityCheck = false;
 bool aimbotTargetLock = false;
-int aimKey = VK_XBUTTON1;
+int aimKey = VK_RBUTTON;
+
+bool triggerbotEnabled = false;
+bool triggerbotHeadOnly = false;
+bool rapidFireEnabled = false;
+float rapidFireSpeed = 8.0f;
 
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
@@ -300,8 +305,9 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
             if (aimbotEnabled) {
                 float centerX = overlayWidth / 2.0f;
                 float centerY = overlayHeight / 2.0f;
-                float fovRadius = aimbotFOV * 5.0f;
-                drawList->AddCircle(ImVec2(centerX, centerY), fovRadius, IM_COL32(255, 255, 255, 80), 64, 1.0f);
+                float fovRadius = std::tan(aimbotFOV * 3.14159f / 180.0f) * (overlayWidth / 2.0f);
+                if (fovRadius < 5.0f) fovRadius = 5.0f;
+                drawList->AddCircle(ImVec2(centerX, centerY), fovRadius, IM_COL32(255, 255, 255, 120), 64, 1.5f);
             }
 
             const PlayerData& localPlayer = entityManager->GetLocalPlayer();
@@ -311,29 +317,27 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
                     localPlayer.position.x, localPlayer.position.y, localPlayer.position.z,
                     (int)entityManager->GetAllPlayers().size());
             }
-            if (localPlayer.isAlive) {
+            if (localPlayer.isAlive && localPlayer.position.Length() > 1.0f) {
                 auto players = entityManager->GetAllPlayers();
                 for (const auto& player : players) {
                     if (player.team == localPlayer.team && !espShowTeammates) continue;
-                    if (!player.isAlive || player.isDormant) continue;
 
                     bool isEnemy = (player.team != localPlayer.team);
                     ImU32 espColor = isEnemy ? IM_COL32(255, 50, 50, 255) : IM_COL32(50, 255, 50, 255);
 
                     Vector3 screenHead, screenFoot;
                     bool footOk = worldToScreen->WorldToScreenPoint(player.position, screenFoot);
-                    if (!footOk) continue;
 
-                    // Estimate head position from foot + ~70 units up
-                    Vector3 estimatedHead(player.position.x, player.position.y, player.position.z + 70.0f);
+                    Vector3 estimatedHead(player.position.x, player.position.y, player.position.z + 72.0f);
                     bool headOk = worldToScreen->WorldToScreenPoint(estimatedHead, screenHead);
                     if (!headOk) {
-                        // Fallback: use foot position
                         screenHead = screenFoot;
                     }
 
-                    float boxH = std::abs(screenHead.y - screenFoot.y) * 1.2f;
-                    if (boxH < 10.0f) boxH = 10.0f;
+                    if (!footOk && !headOk) continue;
+
+                    float boxH = std::abs(screenHead.y - screenFoot.y);
+                    if (boxH < 20.0f) boxH = 20.0f;
                     float boxW = boxH * 0.6f;
                     float boxX = screenHead.x - boxW / 2.0f;
                     float boxY = screenHead.y;
@@ -364,11 +368,11 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
 
                     if (espSnaplines) {
                         ImVec2 center(overlayWidth / 2.0f, overlayHeight);
-                        drawList->AddLine(center, ImVec2(screenFoot.x, screenFoot.y), espColor);
+                        drawList->AddLine(center, ImVec2(screenFoot.x, screenFoot.y), espColor, 1.0f);
                     }
 
                     if (espHeadDot) {
-                        drawList->AddCircleFilled(ImVec2(screenHead.x, screenHead.y), 4.0f, IM_COL32(255, 0, 0, 255), 16);
+                        drawList->AddCircleFilled(ImVec2(screenHead.x, screenHead.y), 3.0f, IM_COL32(255, 0, 0, 255), 16);
                     }
                 }
             }
@@ -402,7 +406,12 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
                     const char* bones[] = { "Head", "Neck", "Chest", "Pelvis", "Feet" };
                     ImGui::Combo("Target Bone", &aimbotBone, bones, IM_ARRAYSIZE(bones));
                     ImGui::Checkbox("Visibility Check", &aimbotVisibilityCheck);
-                    ImGui::Checkbox("Target Lock", &aimbotTargetLock);
+                    ImGui::Checkbox("Target Lock (Follow)", &aimbotTargetLock);
+                    ImGui::Separator();
+                    ImGui::Checkbox("Triggerbot", &triggerbotEnabled);
+                    ImGui::Checkbox("Triggerbot Head Only", &triggerbotHeadOnly);
+                    ImGui::Separator();
+                    ImGui::Checkbox("Rapid Fire", &rapidFireEnabled);
                     ImGui::EndTabItem();
                 }
                 ImGui::EndTabBar();
@@ -410,6 +419,10 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
 
             ImGui::Separator();
             ImGui::Text("Press INSERT to toggle menu");
+            ImGui::Separator();
+            if (ImGui::Button("Detach & Exit", ImVec2(-1, 0))) {
+                running = false;
+            }
             ImGui::End();
         }
 
@@ -422,11 +435,27 @@ void RenderThread(HWND overlayWindow, DWORD cs2ProcessId,
         aimSettings.targetBone = (AimBone)aimbotBone;
         aimSettings.visibilityCheck = aimbotVisibilityCheck;
         aimSettings.targetLock = aimbotTargetLock;
+        aimSettings.triggerbotEnabled = triggerbotEnabled;
+        aimSettings.triggerbotHeadOnly = triggerbotHeadOnly;
+        aimSettings.rapidFireEnabled = rapidFireEnabled;
+        aimSettings.rapidFireSpeed = rapidFireSpeed;
         aimbot->SetSettings(aimSettings);
 
-        // Run aimbot when aim key is held
+        // Run aimbot when aim key is held (right mouse button)
         if (aimbotEnabled && (GetAsyncKeyState(aimKey) & 0x8000)) {
             aimbot->Aim();
+        } else if (!aimbotTargetLock) {
+            aimbot->ResetTarget();
+        }
+
+        // Run triggerbot every frame when enabled
+        if (triggerbotEnabled) {
+            aimbot->Triggerbot();
+        }
+
+        // Run rapid fire every frame when enabled
+        if (rapidFireEnabled) {
+            aimbot->RapidFire();
         }
 
         // Render

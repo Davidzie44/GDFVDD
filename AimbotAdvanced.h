@@ -7,25 +7,29 @@
 #include "EntityManager.h"
 #include <cmath>
 #include <algorithm>
+#include <windows.h>
 
-// Bone selection enum
 enum class AimBone {
-    HEAD = 6,
-    NECK = 5,
-    CHEST = 4,
+    HEAD = 0,
+    NECK = 1,
+    CHEST = 2,
     PELVIS = 3,
-    FEET = 0
+    FEET = 4
 };
 
 struct AimbotSettings {
     bool enabled = false;
-    float smoothing = 2.0f;  // 1.0 = no smoothing, higher = smoother
-    float fov = 15.0f;       // FOV threshold in degrees
+    float smoothing = 1.0f;
+    float fov = 30.0f;
     AimBone targetBone = AimBone::HEAD;
-    float rcsAmount = 2.0f;  // RCS multiplier (0.0 = off, 2.0 = full)
+    float rcsAmount = 2.0f;
     bool visibilityCheck = false;
-    bool targetLock = false; // Lock onto target until death or key release
-    int targetPriority = 0;  // 0 = FOV, 1 = Distance
+    bool targetLock = false;
+    int targetPriority = 0;
+    bool triggerbotEnabled = false;
+    bool triggerbotHeadOnly = false;
+    bool rapidFireEnabled = false;
+    float rapidFireSpeed = 8.0f;
 };
 
 class AimbotAdvanced {
@@ -33,205 +37,139 @@ private:
     ProcessMemory& process;
     WorldToScreen& worldToScreen;
     EntityManager& entityManager;
-    
     AimbotSettings settings;
-    
-    // Current target
     PlayerData currentTarget;
     bool hasTarget = false;
-    
+
     const float PI = 3.14159265358979323846f;
-    
-    // Linear interpolation
-    float Lerp(float start, float end, float t) {
-        return start + (end - start) / t;
-    }
-    
-    // Read current view angles from dwViewAngles
+
     ViewAngles ReadViewAngles() const {
-        uintptr_t viewAnglesAddress = process.GetClientDllBase() + Offsets::client_dll::dwViewAngles;
-        
+        uintptr_t addr = process.GetClientDllBase() + Offsets::client_dll::dwViewAngles;
         try {
-            float pitch = process.ReadMemory<float>(viewAnglesAddress);
-            float yaw = process.ReadMemory<float>(viewAnglesAddress + 0x4);
+            float pitch = process.ReadMemory<float>(addr);
+            float yaw = process.ReadMemory<float>(addr + 0x4);
             return ViewAngles(pitch, yaw);
-        } catch (...) {
-            return ViewAngles(0, 0);
-        }
+        } catch (...) { return ViewAngles(0, 0); }
     }
-    
-    // Write view angles to dwCSGOInput + 0x688 (the input layer)
+
     void WriteViewAngles(const ViewAngles& angles) const {
-        uintptr_t viewAnglesAddress = process.GetClientDllBase() + Offsets::client_dll::dwCSGOInput + 0x688;
-        
+        uintptr_t addr = process.GetClientDllBase() + Offsets::client_dll::dwCSGOInput + 0x688;
         try {
-            process.WriteMemory<float>(viewAnglesAddress, angles.pitch);
-            process.WriteMemory<float>(viewAnglesAddress + 0x4, angles.yaw);
-        } catch (...) {
-        }
+            process.WriteMemory<float>(addr, angles.pitch);
+            process.WriteMemory<float>(addr + 0x4, angles.yaw);
+        } catch (...) {}
     }
-    
-    // Read local player camera position
+
     Vector3 GetCameraPosition() const {
+        const PlayerData& local = entityManager.GetLocalPlayer();
+        if (local.pawnAddr != 0 && local.position.Length() > 0.1f) {
+            return Vector3(local.position.x, local.position.y, local.position.z + 64.0f);
+        }
         return worldToScreen.GetCameraPosition();
     }
-    
-    // Alternative: read from pawn + 0x1604 (m_vecLastClipCameraPos)
-    Vector3 GetCameraPositionFromPawn() const {
-        Entity localPawn = entityManager.GetLocalPawn();
-        if (!localPawn.IsValid()) return Vector3();
-        
-        try {
-            uintptr_t pawnAddr = localPawn.GetAddress();
-            float x = process.ReadMemory<float>(pawnAddr + 0x1604);
-            float y = process.ReadMemory<float>(pawnAddr + 0x1604 + 0x4);
-            float z = process.ReadMemory<float>(pawnAddr + 0x1604 + 0x8);
-            return Vector3(x, y, z);
-        } catch (...) {
-            return Vector3();
-        }
-    }
-    
-    // Calculate aim angles to target position
+
     ViewAngles CalculateAimAngles(const Vector3& cameraPos, const Vector3& targetPos) {
-        // Calculate delta vector
-        float deltaX = targetPos.x - cameraPos.x;
-        float deltaY = targetPos.y - cameraPos.y;
-        float deltaZ = targetPos.z - cameraPos.z;
-        
-        // Calculate distance
-        float distance = std::sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ);
-        
-        if (distance < 0.001f) {
-            return ViewAngles(0, 0);
-        }
-        
-        // Calculate pitch using asin (alternative method)
-        // Pitch = -asin(delta.z / distance) * (180/PI)
-        float pitch = -std::asin(deltaZ / distance) * (180.0f / PI);
-        
-        // Calculate yaw
-        // Yaw = atan2(delta.y, delta.x) * (180/PI)
-        float yaw = std::atan2(deltaY, deltaX) * (180.0f / PI);
-        
+        float dx = targetPos.x - cameraPos.x;
+        float dy = targetPos.y - cameraPos.y;
+        float dz = targetPos.z - cameraPos.z;
+        float dist2D = std::sqrt(dx * dx + dy * dy);
+        float pitch = -std::atan2(dz, dist2D) * (180.0f / PI);
+        float yaw = std::atan2(dy, dx) * (180.0f / PI);
         ViewAngles angles(pitch, yaw);
         angles.Normalize();
-        
         return angles;
     }
-    
-    // Calculate FOV to target
-    float CalculateFOV(const ViewAngles& currentAngles, const ViewAngles& targetAngles) {
-        float deltaPitch = targetAngles.pitch - currentAngles.pitch;
-        float deltaYaw = targetAngles.yaw - currentAngles.yaw;
-        
-        // Normalize yaw delta
-        while (deltaYaw > 180.0f) deltaYaw -= 360.0f;
-        while (deltaYaw < -180.0f) deltaYaw += 360.0f;
-        
-        // Calculate FOV as sqrt of squared deltas
-        float fov = std::sqrt(deltaPitch * deltaPitch + deltaYaw * deltaYaw);
-        
-        return fov;
+
+    float CalculateFOV(const ViewAngles& current, const ViewAngles& target) {
+        float dp = target.pitch - current.pitch;
+        float dy = target.yaw - current.yaw;
+        while (dy > 180.0f) dy -= 360.0f;
+        while (dy < -180.0f) dy += 360.0f;
+        return std::sqrt(dp * dp + dy * dy);
     }
-    
-    // Apply smoothing to angles
+
     ViewAngles SmoothAngles(const ViewAngles& current, const ViewAngles& target) {
         ViewAngles smoothed;
-        
-        // Smooth pitch
-        smoothed.pitch = Lerp(current.pitch, target.pitch, settings.smoothing);
-        
-        // Smooth yaw with shortest path
+        float sm = settings.smoothing;
+        if (sm < 1.0f) sm = 1.0f;
+        smoothed.pitch = current.pitch + (target.pitch - current.pitch) / sm;
         float yawDelta = target.yaw - current.yaw;
-        
-        // Normalize yaw delta to [-180, 180]
         while (yawDelta > 180.0f) yawDelta -= 360.0f;
         while (yawDelta < -180.0f) yawDelta += 360.0f;
-        
-        smoothed.yaw = current.yaw + yawDelta / settings.smoothing;
-        
+        smoothed.yaw = current.yaw + yawDelta / sm;
         smoothed.Normalize();
-        
         return smoothed;
     }
-    
-    // Apply RCS (Recoil Control System)
+
     ViewAngles ApplyRCS(const ViewAngles& angles, const Vector2& aimPunch) {
         ViewAngles corrected = angles;
-        
-        // Subtract aim punch * RCS amount
         corrected.pitch -= aimPunch.x * settings.rcsAmount;
         corrected.yaw -= aimPunch.y * settings.rcsAmount;
-        
         corrected.Normalize();
-        
         return corrected;
     }
-    
-    // Get target position based on bone selection
+
     Vector3 GetTargetPosition(const PlayerData& player) {
         switch (settings.targetBone) {
-            case AimBone::HEAD:
-                return player.headPosition;
-            case AimBone::NECK:
-                // Neck is between head and chest
-                return Vector3(
-                    (player.headPosition.x + player.position.x) / 2,
-                    (player.headPosition.y + player.position.y) / 2,
-                    (player.headPosition.z + player.position.z) / 2
-                );
-            case AimBone::CHEST:
-                return Vector3(
-                    player.position.x,
-                    player.position.y,
-                    player.position.z + 20.0f
-                );
-            case AimBone::PELVIS:
-                return Vector3(
-                    player.position.x,
-                    player.position.y,
-                    player.position.z + 10.0f
-                );
-            case AimBone::FEET:
-                return player.position;
-            default:
-                return player.headPosition;
+            case AimBone::HEAD:  return Vector3(player.position.x, player.position.y, player.position.z + 64.0f);
+            case AimBone::NECK:  return Vector3(player.position.x, player.position.y, player.position.z + 56.0f);
+            case AimBone::CHEST: return Vector3(player.position.x, player.position.y, player.position.z + 40.0f);
+            case AimBone::PELVIS:return Vector3(player.position.x, player.position.y, player.position.z + 20.0f);
+            case AimBone::FEET:  return player.position;
+            default:             return Vector3(player.position.x, player.position.y, player.position.z + 64.0f);
         }
     }
-    
-    // Check if target is visible (using m_iIDEntIndex)
+
     bool IsVisible(const PlayerData& player) {
         if (!settings.visibilityCheck) return true;
-        
         try {
-            // Read m_iIDEntIndex from local pawn
             Entity localPawn = entityManager.GetLocalPawn();
             if (!localPawn.IsValid()) return false;
-            
-            int crosshairEntity = localPawn.GetEntityIndex();
-            
-            // Check if crosshair entity matches target
+            int crosshairEntity = process.ReadMemory<int>(localPawn.GetAddress() + Offsets::schema::m_iIDEntIndex);
             return crosshairEntity == player.entityIndex;
-        } catch (...) {
-            return false;
-        }
+        } catch (...) { return false; }
     }
-    
-    // Get local player aim punch
+
     Vector2 GetLocalAimPunch() const {
         Entity localPawn = entityManager.GetLocalPawn();
         if (!localPawn.IsValid()) return Vector2(0, 0);
-        
         return localPawn.GetAimPunch();
     }
-    
-    // Check if local player is shooting
+
     bool IsShooting() const {
         Entity localPawn = entityManager.GetLocalPawn();
         if (!localPawn.IsValid()) return false;
-        
         return localPawn.GetShotsFired() > 0;
+    }
+
+    uintptr_t ResolveEntityByIndex(int entityIndex) {
+        uintptr_t elBase = process.ReadMemory<uintptr_t>(
+            process.GetClientDllBase() + Offsets::client_dll::dwEntityList
+        );
+        if (elBase == 0 || entityIndex < 0 || entityIndex > 2047) return 0;
+        try {
+            uint32_t pageIndex = entityIndex >> 9;
+            uint32_t pageOffset = entityIndex & 0x1FF;
+            uintptr_t listEntry = process.ReadMemory<uintptr_t>(
+                elBase + (uintptr_t)pageOffset * 0x10 + 0x10
+            );
+            if (listEntry == 0) return 0;
+            return process.ReadMemory<uintptr_t>(listEntry + (uintptr_t)pageIndex * 0x70);
+        } catch (...) { return 0; }
+    }
+
+    void SendMouseDown() {
+        INPUT input = {};
+        input.type = INPUT_MOUSE;
+        input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+        SendInput(1, &input, sizeof(INPUT));
+    }
+
+    void SendMouseUp() {
+        INPUT input = {};
+        input.type = INPUT_MOUSE;
+        input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        SendInput(1, &input, sizeof(INPUT));
     }
 
 public:
@@ -239,157 +177,114 @@ public:
         : process(pm), worldToScreen(wts), entityManager(em), hasTarget(false) {
         currentTarget = PlayerData{};
     }
-    
-    // Update aimbot settings
-    void SetSettings(const AimbotSettings& newSettings) {
-        settings = newSettings;
-    }
-    
-    AimbotSettings GetSettings() const {
-        return settings;
-    }
-    
-    // Main aim function
+
+    void SetSettings(const AimbotSettings& newSettings) { settings = newSettings; }
+    AimbotSettings GetSettings() const { return settings; }
+
     void Aim() {
-        if (!settings.enabled) {
-            hasTarget = false;
-            return;
-        }
-        
-        // Get local player data
+        if (!settings.enabled) { hasTarget = false; return; }
+
         const PlayerData& localPlayer = entityManager.GetLocalPlayer();
-        if (!localPlayer.isAlive) {
-            hasTarget = false;
-            return;
-        }
-        
-        // Get camera position
+        if (!localPlayer.isAlive) { hasTarget = false; return; }
+
         Vector3 cameraPos = GetCameraPosition();
-        if (cameraPos.Length() < 0.1f) {
-            cameraPos = GetCameraPositionFromPawn();
-        }
-        
-        if (cameraPos.Length() < 0.1f) {
-            hasTarget = false;
-            return;
-        }
-        
-        // Get current view angles
+        if (cameraPos.Length() < 0.1f) { hasTarget = false; return; }
+
         ViewAngles currentAngles = ReadViewAngles();
-        
-        // Get valid targets
         auto targets = entityManager.GetValidTargets();
-        if (targets.empty()) {
-            hasTarget = false;
-            return;
-        }
-        
-        // Find best target
+        if (targets.empty()) { hasTarget = false; return; }
+
         PlayerData bestTarget;
-        float bestScore = settings.fov; // FOV threshold
+        float bestScore = settings.fov;
         bool foundTarget = false;
-        
+
         for (const auto& target : targets) {
-            // Get target position based on bone selection
             Vector3 targetPos = GetTargetPosition(target);
-            
-            // Calculate aim angles
             ViewAngles targetAngles = CalculateAimAngles(cameraPos, targetPos);
-            
-            // Calculate FOV
             float fov = CalculateFOV(currentAngles, targetAngles);
-            
-            // Check FOV threshold
             if (fov > settings.fov) continue;
-            
-            // Check visibility
-            if (!IsVisible(target)) continue;
-            
-            // Calculate score based on priority
-            float score;
-            if (settings.targetPriority == 0) {
-                // Priority by FOV (lower is better)
-                score = fov;
-            } else {
-                // Priority by distance (closer is better)
-                score = target.distance;
-            }
-            
+
+            float score = (settings.targetPriority == 0) ? fov : target.distance;
             if (score < bestScore) {
                 bestScore = score;
                 bestTarget = target;
                 foundTarget = true;
             }
         }
-        
-        if (!foundTarget) {
-            hasTarget = false;
-            return;
-        }
-        
-        // Lock onto target if enabled
-        if (settings.targetLock && hasTarget) {
-            // Keep targeting current target if still valid
-            bool targetStillValid = false;
-            for (const auto& target : targets) {
-                if (target.pawnAddr == currentTarget.pawnAddr) {
-                    bestTarget = target;
-                    targetStillValid = true;
+
+        if (settings.targetLock && hasTarget && foundTarget) {
+            bool stillValid = false;
+            for (const auto& t : targets) {
+                if (t.pawnAddr == currentTarget.pawnAddr) {
+                    currentTarget = t;
+                    stillValid = true;
                     break;
                 }
             }
-            
-            if (!targetStillValid) {
-                hasTarget = false;
-                return;
-            }
-        } else {
+            if (!stillValid) { hasTarget = false; }
+        } else if (foundTarget) {
             currentTarget = bestTarget;
             hasTarget = true;
+        } else {
+            hasTarget = false;
+            return;
         }
-        
-        // Get target position
+
+        if (!hasTarget) return;
+
         Vector3 targetPos = GetTargetPosition(currentTarget);
-        
-        // Calculate target angles
         ViewAngles targetAngles = CalculateAimAngles(cameraPos, targetPos);
-        
-        // Apply RCS if shooting
+
         if (settings.rcsAmount > 0.0f && IsShooting()) {
             Vector2 aimPunch = GetLocalAimPunch();
             targetAngles = ApplyRCS(targetAngles, aimPunch);
         }
-        
-        // Apply smoothing
+
         ViewAngles smoothedAngles = SmoothAngles(currentAngles, targetAngles);
-        
-        // Write angles
         WriteViewAngles(smoothedAngles);
     }
-    
-    // Reset target
-    void ResetTarget() {
-        hasTarget = false;
-        currentTarget = PlayerData{};
+
+    void Triggerbot() {
+        if (!settings.triggerbotEnabled) return;
+
+        const PlayerData& localPlayer = entityManager.GetLocalPlayer();
+        if (!localPlayer.isAlive) return;
+
+        try {
+            Entity localPawn = entityManager.GetLocalPawn();
+            if (!localPawn.IsValid()) return;
+
+            int crosshairEntIdx = process.ReadMemory<int>(localPawn.GetAddress() + Offsets::schema::m_iIDEntIndex);
+            if (crosshairEntIdx <= 0 || crosshairEntIdx > 2047) return;
+
+            uintptr_t entityAddr = ResolveEntityByIndex(crosshairEntIdx);
+            if (entityAddr == 0) return;
+
+            int health = process.ReadMemory<int>(entityAddr + Offsets::schema::m_iHealth);
+            int team = process.ReadMemory<int>(entityAddr + Offsets::schema::m_iTeamNum);
+            if (health <= 0 || health > 200) return;
+            if (team == localPlayer.team) return;
+
+            SendMouseDown();
+            Sleep(16);
+            SendMouseUp();
+        } catch (...) {}
     }
-    
-    // Check if currently targeting
-    bool HasTarget() const {
-        return hasTarget;
+
+    void RapidFire() {
+        if (!settings.rapidFireEnabled) return;
+
+        const PlayerData& localPlayer = entityManager.GetLocalPlayer();
+        if (!localPlayer.isAlive) return;
+
+        if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) {
+            SendMouseUp();
+            Sleep(1);
+            SendMouseDown();
+        }
     }
-    
-    // Get current target
-    const PlayerData& GetCurrentTarget() const {
-        return currentTarget;
-    }
-    
-    // Get FOV to specific player
-    float GetFOVToPlayer(const PlayerData& player) {
-        Vector3 cameraPos = GetCameraPosition();
-        ViewAngles currentAngles = ReadViewAngles();
-        Vector3 targetPos = GetTargetPosition(player);
-        ViewAngles targetAngles = CalculateAimAngles(cameraPos, targetPos);
-        
-        return CalculateFOV(currentAngles, targetAngles);
-    }
+
+    void ResetTarget() { hasTarget = false; currentTarget = PlayerData{}; }
+    bool HasTarget() const { return hasTarget; }
+    const PlayerData& GetCurrentTarget() const { return currentTarget; }
 };
