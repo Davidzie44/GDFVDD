@@ -113,6 +113,14 @@ public:
         return engine2DllBase;
     }
 
+    DWORD GetProcessId() const {
+        return processId;
+    }
+
+    HANDLE GetProcessHandle() const {
+        return processHandle;
+    }
+
     template<typename T>
     T ReadMemory(uintptr_t address) const {
         if (!IsAttached()) {

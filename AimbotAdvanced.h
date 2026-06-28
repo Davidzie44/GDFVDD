@@ -5,6 +5,7 @@
 #include "WorldToScreen.h"
 #include "Offsets.h"
 #include "EntityManager.h"
+#include "VisibilityCheck.h"
 #include <cmath>
 #include <algorithm>
 #include <windows.h>
@@ -40,6 +41,7 @@ private:
     ProcessMemory& process;
     WorldToScreen& worldToScreen;
     EntityManager& entityManager;
+    VisibilityCheck& visibilityCheck;
     AimbotSettings settings;
     PlayerData currentTarget;
     bool hasTarget = false;
@@ -125,6 +127,15 @@ private:
 
     bool IsVisible(const PlayerData& player) {
         if (!settings.visibilityCheck) return true;
+
+        // Use EngineTrace if available (proper wall check)
+        if (visibilityCheck.IsAvailable()) {
+            Vector3 eyePos = GetCameraPosition();
+            Vector3 targetPos = GetTargetPosition(player);
+            return visibilityCheck.IsVisible(eyePos, targetPos);
+        }
+
+        // Fallback: crosshair-based check
         try {
             Entity localPawn = entityManager.GetLocalPawn();
             if (!localPawn.IsValid()) return false;
@@ -185,8 +196,8 @@ private:
     }
 
 public:
-    AimbotAdvanced(ProcessMemory& pm, WorldToScreen& wts, EntityManager& em)
-        : process(pm), worldToScreen(wts), entityManager(em), hasTarget(false) {
+    AimbotAdvanced(ProcessMemory& pm, WorldToScreen& wts, EntityManager& em, VisibilityCheck& vc)
+        : process(pm), worldToScreen(wts), entityManager(em), visibilityCheck(vc), hasTarget(false) {
         currentTarget = PlayerData{};
     }
 
@@ -231,6 +242,8 @@ public:
 
             for (const auto& target : targets) {
                 if (target.isDormant) continue;
+
+                if (settings.visibilityCheck && !IsVisible(target)) continue;
 
                 Vector3 targetPos = GetTargetPosition(target);
                 ViewAngles targetAngles = CalculateAimAngles(cameraPos, targetPos);

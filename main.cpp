@@ -22,6 +22,7 @@
 #include "WorldToScreen.h"
 #include "EntityManager.h"
 #include "AimbotAdvanced.h"
+#include "VisibilityCheck.h"
 #include "Offsets.h"
 
 #pragma comment(lib, "d3d11.lib")
@@ -586,11 +587,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     ShowWindow(overlayWindow, SW_SHOWDEFAULT);
     UpdateWindow(overlayWindow);
 
-    Log("Step 8: Create EntityManager, WorldToScreen, AimbotAdvanced");
+    Log("Step 8: Create EntityManager, WorldToScreen, VisibilityCheck, AimbotAdvanced");
     EntityManager entityManager(process);
     WorldToScreen worldToScreen(process, cs2Rect.w, cs2Rect.h);
-    AimbotAdvanced aimbot(process, worldToScreen, entityManager);
-    Log("All components created OK");
+    VisibilityCheck visibilityCheck(process);
+    bool visCheckOk = visibilityCheck.Initialize();
+    AimbotAdvanced aimbot(process, worldToScreen, entityManager, visibilityCheck);
+    LogFmt("All components created OK, visibility check %s", visCheckOk ? "ENABLED" : "disabled");
 
     Log("Step 9: Start render thread");
     std::thread renderThread(RenderThread, overlayWindow, cs2Pid,
