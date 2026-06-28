@@ -217,14 +217,21 @@ public:
         auto targets = entityManager.GetValidTargets();
         if (targets.empty()) { hasTarget = false; return; }
 
-        // If we have a locked target, check if it's still valid
+        // If we have a locked target, check if it's still valid (alive + in FOV + visible)
         if (settings.targetLock && hasTarget) {
             bool stillValid = false;
             for (const auto& t : targets) {
                 if (t.pawnAddr == currentTarget.pawnAddr) {
                     if (t.isAlive && t.health > 0) {
-                        currentTarget = t;
-                        stillValid = true;
+                        Vector3 targetPos = GetTargetPosition(t);
+                        ViewAngles targetAngles = CalculateAimAngles(cameraPos, targetPos);
+                        float fov = CalculateFOV(currentAngles, targetAngles);
+                        bool inFov = fov <= settings.fov;
+                        bool visible = !settings.visibilityCheck || IsVisible(t);
+                        if (inFov && visible) {
+                            currentTarget = t;
+                            stillValid = true;
+                        }
                     }
                     break;
                 }
@@ -243,12 +250,12 @@ public:
             for (const auto& target : targets) {
                 if (target.isDormant) continue;
 
-                if (settings.visibilityCheck && !IsVisible(target)) continue;
-
                 Vector3 targetPos = GetTargetPosition(target);
                 ViewAngles targetAngles = CalculateAimAngles(cameraPos, targetPos);
                 float fov = CalculateFOV(currentAngles, targetAngles);
                 if (fov > settings.fov) continue;
+
+                if (settings.visibilityCheck && !IsVisible(target)) continue;
 
                 float score = (settings.targetPriority == 0) ? fov : target.distance;
                 if (score < bestScore) {
